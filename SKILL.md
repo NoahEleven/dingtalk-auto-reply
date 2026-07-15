@@ -8,6 +8,8 @@ agent_created: true
 
 监控钉钉未读会话，单聊用 AI 以老板口吻自动回复，群聊/指定名单只发微信提醒（不代发，防社死）。
 
+> 🔗 项目主页 / 源码：https://github.com/NoahEleven/dingtalk-auto-reply
+
 ## 技能包含的文件（自包含，可直接移植）
 
 ```
