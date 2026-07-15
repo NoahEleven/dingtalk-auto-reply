@@ -1,0 +1,21 @@
+# 私密配置（真实身份、密钥），切勿提交/分发
+.env
+
+# 运行时缓存与状态（含会话 cid、openid 等）
+_media_cache/
+*.state.json
+dingtalk_auto_state.json
+monitor.log
+
+# 运行时日志与锁（每台机器本地生成，不随 skill 分发）
+dingtalk_auto_debug.log
+dingtalk_auto_audit.jsonl
+dingtalk_auto.lock
+
+# 启动器（.vbs）不随 skill 分发：由本机 gen_launcher.py 生成到 Startup，
+# 换机/移植后首次运行自动落地，避免硬编码路径被误传。
+dingtalk_auto_reply_launcher.vbs
+
+# Python
+__pycache__/
+*.pyc
