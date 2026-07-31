@@ -1,161 +1,202 @@
-# 钉钉自动回复（dingtalk-auto-reply）
+# dingtalk-auto-reply
 
-> 监控钉钉未读会话，单聊用 AI 以老板口吻自动回复，群聊 / 指定名单只发微信提醒（**不代发，防社死**）。
+> 钉钉未读监控 → AI 以本人身份代复 → 微信通知
 
-🔗 **项目主页 / 源码**：https://github.com/NoahEleven/dingtalk-auto-reply
-
----
-
-## ✨ 功能特性
-
-- **未读监控**：通过 `dws`（DingTalk Workspace CLI）轮询未读会话，**不依赖本机钉钉客户端**。
-- **单聊 AI 代复**：用 CodeBuddy Agent SDK（模型 `hy3`）以「老板本人」口吻自动回复，拒绝自报家门 / 称呼对方为老板。
-- **群聊只提醒**：仅 `@我` / `@all` 推微信通知，**绝不代发**（防止在群里乱说话社死）。
-- **抢答防护**：发现未读后延迟 2 分钟 + 老板活跃检测，老板正在聊就绝不抢话。
-- **图片识别**：单聊图片直接内联 AI 识别并代复；群聊 `@我` 的图片识别后补进微信通知。
-- **微信通知**：代发 / 需人工处理的消息推送到老板微信（依赖 `weixinclaw-proactive-push` skill，未装则自动降级为仅日志）。
-- **健壮常驻**：单实例锁、日志轮转、心跳保活、Windows Startup 看门狗崩溃自愈。
+监控钉钉未读会话：单聊用 AI 以**本人口吻**自动回复（普通员工语气、平级回同事）；群聊 / 指定名单只发微信提醒（**不代发，防社死**）。
+回复生成、图片识别统一走 **CodeBuddy Agent SDK**（hy3），无需任何外部 API Key。
 
 ---
 
-## 🔧 工作原理
+## ✨ 特性
+
+- **单聊 AI 代复**：以本人身份、平级同事口吻自动回复，一人一会话、记忆连续。
+- **群聊只提醒不代发**：仅当被 `@我` / `@all` 时才推微信提醒，避免群聊社死。
+- **事实 grounding**：事实性问题强制先查 gbrain 知识库（失败回退本地文档），禁止凭印象乱答。
+- **多模态**：群 `@我` 图片、单聊图片自动识别补全内容，与文本**同一 SDK 后端、零额外 Key**。
+- **抢答防护**：延迟窗口 + 老板活跃检测，老板在聊就先不插嘴。
+- **健壮性**：心跳健康标记、单实例锁、崩溃自愈看门狗、审计日志、去重、日志轮转。
+- **可移植**：路径零硬编码用户名，整目录拷贝即迁移；代码不含任何真实身份隐私。
+
+---
+
+## 🧱 架构
 
 ```
-钉钉未读 ──dws──▶ 拉未读会话
-   │
-   ├─ 单聊 ──▶ 活跃检测 + 延迟2min ──▶ AI 生成老板口吻回复 ──▶ dws 带引用回复 ──▶ 微信通知
-   │
-   └─ 群聊 ──▶ 仅 @我/@all ──▶ 图片识别(可选) ──▶ 微信通知(不代发)
+dingtalk_unread_monitor.py   入口：调度主循环（仅 docstring + main + re-export）
+runtime.py                   基础/配置层：.env 加载、SDK 探测、路径解析、常量、日志/锁/缓存/审计/鉴权
+dingtalk_api.py              钉钉交互层：dws 调用、未读/消息拉取、单聊·群@判定、图片下载、发送
+vision.py                    多模态层：图片识别（统一走 CodeBuddy Agent SDK，与文本同后端）
+reply.py                     回复生成层：人设 / 查表 grounding / SDK 生成 / 微信推送
 ```
 
-关键设计见 [SKILL.md](SKILL.md)（给 AI agent 的完整说明，含踩坑记录）。
+Pipeline（顺序不可乱）：
+
+1. `dws chat message list-unread-conversations` → 只返回有未读的会话（天然过滤）。
+2. 单聊 → 拉最新一条消息（`--direction older --time now`）。
+3. **回复生成**：`detect_table_intent` 判断查哪张表 → `fetch_table_context` 拉本人名下未解决项注入 → CodeBuddy Agent SDK 生成回复（`session_id=dt_<cid>` 实现记忆连续）。SDK 不可用时**不代发、转微信人工**。
+4. `dws chat message reply --ref-msg-id ... --text ...` 带引用回复。
+5. 微信推送（默认 `~/.workbuddy/skills/weixinclaw-proactive-push/send.js`，仅文本；未装自动降级为仅日志）。
 
 ---
 
-## 📦 安装部署
-
-### 1. 前置依赖（目标机需具备）
-
-| 依赖 | 说明 | 备注 |
-|------|------|------|
-| **dws CLI** | WorkBuddy 自带连接器 | 需 `dws patch chmod` 授权 `chat.message:list` / `chat.message:send` / `contact:search`，并加入系统 PATH |
-| **codebuddy CLI** | WorkBuddy managed node 自带 | SDK 内部 spawn 它跑 agent |
-| **codebuddy-agent-sdk** | Python SDK（唯一后端） | `pip install codebuddy-agent-sdk`，必须装到运行脚本的 python |
-| **weixinclaw-proactive-push** | 微信推送（可选） | 未装则自动降级为仅日志 |
-
-> ⚠️ **dws 必须在系统 PATH 上**：终端能敲出 `dws` 即说明就位。本技能 `gen_launcher.py` 会自动把 dws/node 目录追加进用户 PATH（幂等，无需手动配）。
-
-### 2. 克隆并配置
-
-```bash
-git clone https://github.com/NoahEleven/dingtalk-auto-reply.git
-cd dingtalk-auto-reply
-
-# 填配置（真实身份写这里，.env 不分发）
-cp .env.example .env
-# 按需编辑 .env：群昵称、本人昵称、CodeBuddy API Key 等
-
-# 自测（集成验证，不真发回复，但会真实调一次 SDK 生成）
-"$PY" _validate.py
-```
-
-### 3. 常驻运行
-
-**Windows（推荐 · Startup 启动器）**
-
-```bash
-# 生成 Startup .vbs 启动器（自带崩溃自愈看门狗，登录后自动运行）
-"$PY" gen_launcher.py
-```
-
-**macOS / Linux**
-
-```bash
-nohup "$PY" dingtalk_unread_monitor.py > ~/.workbuddy/dingtalk_auto_daemon.log 2>&1 & disown
-```
-
-> `$PY` 指装了 `codebuddy-agent-sdk` 的 python（WorkBuddy managed：`%USERPROFILE%\.workbuddy\binaries\python\envs\default\Scripts\python.exe`）。
-
----
-
-## ⚙️ 配置（`.env`，可选但推荐）
-
-所有项均可选，留空 = 自动探测 / 默认。完整注释见 [.env.example](.env.example)，常用项：
-
-| 变量 | 说明 | 默认 |
-|------|------|------|
-| `CODEBUDDY_API_KEY` | CodeBuddy API Key（无人值守推荐；留空则复用 CLI 已登录凭据） | 空 |
-| `POLL_INTERVAL` | 轮询间隔（秒） | `10` |
-| `DRY_RUN=1` | 只验证不真发 | 关闭 |
-| `REPLY_DELAY_SEC` | 单聊代发前延迟窗口（秒） | `120` |
-| `ACTIVE_WINDOW_SEC` | 老板活跃判定窗口（秒） | `300` |
-| `GROUP_PUSH` | 群消息微信策略：`atme`/`all`/`off` | `atme` |
-| `MENTION_NAMES` | 群 `@我` 昵称候选（你的昵称） | `老板` |
-| `SKIP_SENDERS` | 不代发名单（家人 / 上级） | 空 |
-| `AUTO_REPLY_IMAGE` | 单聊图片代复开关 | 开 |
-| `VISION_API_KEY/BASE_URL/MODEL` | 图片识别后端（默认 hy3 零配置） | 空 |
-
----
-
-## 🚀 使用
-
-```bash
-# 1) 先验证（不真发、不推微信）
-DRY_RUN=1 "$PY" dingtalk_unread_monitor.py
-
-# 2) 真实运行（代老板发钉钉 + 推微信）
-"$PY" dingtalk_unread_monitor.py
-
-# 3) 补发漏掉的单聊（监控曾宕机 / DRY_RUN 期间漏的）
-"$PY" recover_missed.py
-
-# 停止（Windows）
-powershell -File stop_monitor.ps1
-```
-
-**诊断日志**：`~/.workbuddy/dingtalk_auto_debug.log`（运行）、`~/.workbuddy/dingtalk_auto_audit.jsonl`（审计）。每 ~120s 一行 `[heartbeat]` 即健康。
-
----
-
-## 🔒 隐私说明
-
-- **源码不含任何真实身份**：真实姓名、昵称、城市、`openDingTalkId` 等一律不硬编码，全部通过私密 `.env` 注入。源码默认值只保留中性词「老板」。
-- **`.env` 不分发**：已被 `.gitignore` 忽略，切勿提交外发。换机时 `cp .env.example .env` 自行填写。
-- **人设红线**：`secretary_system_prompt.txt` 明确禁止回复里输出任何系统标识 / 用户名 / 英文 ID，也禁止主动透露老板真实个人信息。
-
----
-
-## 📁 文件结构
+## 📦 文件清单
 
 ```
 dingtalk-auto-reply/
-├── SKILL.md                      # 完整说明（给 AI agent，含踩坑记录）
-├── README.md                     # 本文件（给人类，上手部署）
-├── dingtalk_unread_monitor.py    # 主脚本（轮询+生成+回复+推送）
-├── gen_launcher.py              # 启动器生成器（本机生成 Startup .vbs）
-├── secretary_system_prompt.txt   # 老板口吻人设
-├── _validate.py                  # 自测脚本（集成验证，不真发）
-├── stop_monitor.ps1             # 精确结束监控进程
-├── recover_missed.py            # 漏发补发
-├── .env.example                  # 配置模板（安全，无真实值）
-└── .gitignore                    # 防误提交 .env
+├── SKILL.md                      # 技能完整说明（本文是精简版）
+├── .env.example                  # 配置样例（cp 为 .env 后填真实身份/Key）
+├── .gitignore                   # 隐私黑名单（.env / _media_cache / .vbs 等不随包分发）
+├── requirements.txt             # 唯一 Python 依赖：codebuddy-agent-sdk
+├── dingtalk_unread_monitor.py    # 入口（调度主循环）
+├── runtime.py                    # 配置/路径/日志/锁/鉴权/共享常量
+├── dingtalk_api.py               # 钉钉交互（dws / 未读 / 发送 / 图片下载）
+├── vision.py                     # 图片识别（CodeBuddy Agent SDK）
+├── reply.py                      # 回复生成（人设 / grounding / SDK / 微信推送）
+├── gen_launcher.py              # 启动器生成器（本机生成 Startup .vbs，不随包分发）
+├── dingtalk-helper-backup.md    # 人设干净部署模板（无私人数据，换机兜底）
+├── _validate.py                  # 自测脚本（集成 / --inject / --test-guard / --test-construct / --test-statemachine / --env）
+├── _setup_env.py                 # 安装脚本：探测并写入 SDK 运行环境到 .env
+├── recover_missed.py            # 漏发补发脚本（监控宕机/DRY_RUN 后手动补）
+└── stop_monitor.ps1             # 精确结束本脚本 python（Windows）
 ```
 
-> 📌 `.vbs` 启动器不随仓库分发（机器专属胶水文件），由 `gen_launcher.py` 在本机生成。
+> 运行时自动生成（已被 `.gitignore` 排除，不随包分发）：`.env`、`_media_cache/`、`__pycache__/`、`dingtalk_auto_reply_launcher.vbs`、各类日志。
 
 ---
 
-## ⚠️ 免责声明
+## 🔧 环境要求
 
-代老板自动发送钉钉消息是**高风险对外操作**。本技能已做抢答防护、质量网、审计日志等多重保险，但仍请：
-- 首次部署务必先 `DRY_RUN=1` 验证；
-- 把家人 / 上级放入 `SKIP_SENDERS` 不代发；
-- 定期查看审计日志 `~/.workbuddy/dingtalk_auto_audit.jsonl`。
+| 依赖 | 说明 |
+|---|---|
+| **Python（default venv）** | 跑脚本的解释器；`codebuddy-agent-sdk` **必须装在这个 venv** 里。Windows：`%USERPROFILE%\.workbuddy\binaries\python\envs\default\Scripts\python.exe`；macOS/Linux：`$HOME/.workbuddy/binaries/python/envs/default/bin/python3` |
+| **codebuddy-agent-sdk** | 生成回复 + 图片识别的唯一后端 | `venv_python -m pip install -r requirements.txt` |
+| **dws CLI** | 拉未读 / 发消息 / 通讯录 | `gen_launcher.py` 自动加入 PATH；`dws patch chmod` 授权 `chat.message:list` / `chat.message:send` / `contact:search` |
+| **codebuddy CLI** | SDK 底层起 prewarm server | 随 WorkBuddy 安装 |
+| **node** | dws NODE-direct 路由 | 装 Node 并在可用路径 |
+| **gbrain MCP（可选）** | 查表 / 知识库；不配则纯人设回复 | `GBRAIN_MCP_URL` / `GBRAIN_MCP_TOKEN`，缺省读 `~/.workbuddy/mcp.json` 的 `gbrain` 条目 |
+| **SDK 运行环境声明（`.env`）** | 让 skill / agent 识别「用哪个 python 跑」 | 安装时跑 `_setup_env.py` 写入 `CODEBUDDY_SDK_PYTHON` 等 |
 
-使用时即代表你已了解并承担相关风险。
+> ⚠️ 裸 managed python / anaconda **不含 SDK**，会导致 `_SDK_AVAILABLE=False`。务必用装了 SDK 的 default venv python 跑。
+
+---
+
+## 🚀 安装与运行
+
+```bash
+# 固定用装了 SDK 的 venv python（下文统称 $PY）
+# Windows:
+PY="$USERPROFILE/.workbuddy/binaries/python/envs/default/Scripts/python.exe"
+# macOS / Linux:
+PY="$HOME/.workbuddy/binaries/python/envs/default/bin/python3"
+
+# 1) 装依赖
+"$PY" -m pip install -r requirements.txt
+
+# 2) 探测并写入 SDK 运行环境（关键：让任意 python 拉起都能自拉回正确 venv）
+"$PY" _setup_env.py
+#   仅预览： _setup_env.py --check     强制覆盖： _setup_env.py --force
+
+# 3) 一键预检（缺啥直接给修复命令）
+"$PY" _validate.py --env
+
+# 4) 填私密身份： cp .env.example .env  → 编辑填 BOSS_UID / SELF_OPEN_ID 等
+
+# 5) 自测（集成验证，不真发；会真实调一次 SDK 生成）
+"$PY" _validate.py
+
+# 6) 真实运行（以本人身份发钉钉 + 推微信）
+"$PY" dingtalk_unread_monitor.py
+```
+
+### 部署（后台常驻）
+
+- **Windows（推荐）**：`"$PY" gen_launcher.py` 生成 Startup `.vbs` 启动器，自带崩溃自愈看门狗（进程不在/卡死 180s 内自动重拉），放入「启动」文件夹即可登录自启。**勿用计划任务**（隔离会话无网、dws 读不到未读）。
+- **macOS / Linux**：
+  ```bash
+  nohup "$PY" dingtalk_unread_monitor.py > ~/.workbuddy/dingtalk_auto_daemon.log 2>&1 & disown
+  ```
+
+### CodeBuddy 认证（启动前必读）
+
+脚本启动即做认证健康检查，未通过以退出码 2 退出（绝不悄悄空跑）：
+
+- **API Key（推荐无人值守）**：`.env` 填 `CODEBUDDY_API_KEY=你的key`（申请：https://copilot.tencent.com 控制台）。
+- **CLI 已登录（零配置）**：留空 Key，脚本复用终端 `codebuddy` 登录过的凭据。
+- 中国版自动适配：检测 `~/.codebuddy/local_storage` 标记 `internal` 自动注入 `CODEBUDDY_INTERNET_ENVIRONMENT=internal`。
+
+---
+
+## ⚙️ 配置（`.env`）
+
+技能目录自带 `.env.example`，`cp .env.example .env` 后按需填写。所有项均可选，留空 = 自动探测 / 默认。常用：
+
+| 变量 | 说明 |
+|---|---|
+| `BOSS_UID` / `SELF_OPENDINGTALK_ID` | 老板钉钉身份（必备，用于识别本人 / 查表过滤） |
+| `SELF_SENDERS` / `MENTION_NAMES` | 本人昵称 / 群 `@我` 昵称候选 |
+| `SKIP_SENDERS` | 不代发名单（家人 / 上级） |
+| `POLL_INTERVAL` | 轮询间隔秒 |
+| `DRY_RUN=1` | 只生成验证、不真发（调试用） |
+| `REPLY_DELAY_SEC` | 延迟窗口秒（默认 120，抢答防护） |
+| `ACTIVE_WINDOW_SEC` | 老板活跃窗口秒（默认 300） |
+| `GROUP_PUSH` | 群消息推微信策略：`atme`(默认) / `all` / `off` |
+| `AUTO_REPLY_IMAGE` | 单聊图片代复开关（默认开） |
+| `VISION_MODEL` | 视觉模型（默认跟随文本主模型 `CODEBUDDY_MODEL` 即 hy3，可单独指定） |
+| `TABLE_GROUNDING=0` | 关闭查表 grounding，纯人设代复（新用户推荐起步） |
+| `GBRAIN_GROUNDING` | gbrain 知识库开关（默认开） |
+| `DINGTALK_AGENT_DISALLOWED_TOOLS` | 危险工具黑名单（默认 `Write,Edit`，可覆盖） |
+
+---
+
+## 🧪 自测脚本 `_validate.py`
+
+| 模式 | 作用 |
+|---|---|
+| 默认 | 集成验证：打印外部二进制 / 人设解析路径 + dws 实际调用比对 |
+| `--env` | 环境预检：逐项 `[OK]/[MISSING]/[WARN]`，缺 SDK/dws 给修复命令 |
+| `--inject` | 注入假消息跑 `gen_reply`，回复**只发给自己**，绝不发别人 |
+| `--test-guard` | 验证抢答防护（活跃检测 + 延迟窗口） |
+| `--test-construct` | 回归 prompt 构造（含 2026-07-30 burst 合并修复），monkey-patch 拦截 SDK，不耗积分 |
+| `--test-statemachine` | 验证延迟代发状态机纯函数（19 条断言，不依赖 dws/SDK） |
+
+---
+
+## 🛡️ 健壮性要点
+
+- **心跳健康标记**：每 ~120s 打 `[heartbeat] alive, unread_now=N`（带 `empty` / `dws_unhealthy!` 区分真无未读 vs dws 坏了伪装健康）；连续失败自动推微信提醒。
+- **单实例锁**：`~/.workbuddy/dingtalk_auto.lock` 存 PID，重复启动自动退出，杜绝双发。
+- **启动 seed 不吞消息**：首轮记去重表（不 retro 历史），但 24h 内到达的单聊未读发一次被动微信提醒。
+- **失败不代发**：生成失败 / 质检拦截 / 媒体无文本 → 绝不发兜底话术，只推微信「需手动处理」。
+- **审计日志**：`~/.workbuddy/dingtalk_auto_audit.jsonl` 记录每次代发 / 跳过（高风险对外操作可追溯）。
+- **日志轮转 / 图片缓存清理**：防常驻下磁盘撑爆。
+- **崩溃自愈看门狗**（Windows 启动器）：进程不在 / 卡死 180s 内自动重拉。
+
+---
+
+## 🔒 隐私与身份
+
+- **源码不含任何真实身份**：真实姓名 / 昵称 / 城市 / `openDingTalkId` 一律不硬编码，全部经私密 `.env` 注入，源码默认只保留中性词「老板」。
+- **`.env` 不分发**：已被 `.gitignore` 忽略，切勿提交或外发。换机 `cp .env.example .env` 自行填写。
+- **人设真源 = codebuddy 注册 agent `dingtalk-helper.md`**：`dingtalk-helper-backup.md` 是其干净模板（占位符 `<...>`，无私人数据），随包兜底；新机器未注册时自动注入。
+- **SDK 运行环境声明（`CODEBUDDY_SDK_PYTHON` 等）非隐私**，可随技能分发；但整个 `.env` 仍被 `.gitignore` 排除。
+
+---
+
+## 📤 迁移到其他电脑
+
+整目录拷贝到目标机 `~/.workbuddy/skills/` 即可。需明确的外部构件：
+
+| 构件 | 是否迁移 |
+|---|---|
+| skill 本体（整目录） | ✅ 拷 |
+| 人设 `dingtalk-helper.md` | ⚠️ 用 `dingtalk-helper-backup.md` 模板填你自己的数据，勿盲目覆盖本机已配置真身 |
+| 工作空间 + cwd 记忆 | ❌ 禁止迁移（含隐私，agent 自动重建） |
+| 私密 `.env` | ⚠️ 不随分发，`cp .env.example .env` 后填 |
+
+换机后：装 SDK → 跑 `_setup_env.py` 写入 SDK 环境 → `_validate.py --env` 预检 → 填 `.env` 身份。
 
 ---
 
 ## 📄 License
 
-MIT —— 自由使用、修改、分发，但需保留版权声明与免责声明。
+内部工具，仅供个人使用。
