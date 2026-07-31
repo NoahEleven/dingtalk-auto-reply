@@ -1,0 +1,8 @@
+# 钉钉自动回复技能运行依赖
+#
+# 安装前提：必须用「装了 SDK 的 default venv python」执行，裸 managed python / anaconda 不含此包。
+#   Windows: %USERPROFILE%\.workbuddy\binaries\python\envs\default\Scripts\python.exe -m pip install -r requirements.txt
+#   macOS/Linux: $HOME/.workbuddy/binaries/python/envs/default/bin/python3 -m pip install -r requirements.txt
+#
+# 一键预检：python _validate.py --env  （会逐项核查并把缺失项修复命令直接打出来）
+codebuddy-agent-sdk
