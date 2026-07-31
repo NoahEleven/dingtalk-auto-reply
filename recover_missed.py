@@ -1,7 +1,7 @@
 """
 钉钉自动回复 · 漏发补发器
 用途：监控进程曾宕机 / 处于 DRY_RUN 模式导致单聊未读没被代复时，
-      手动把"当前仍未被处理的单聊未读"用老板口吻补发一条回复。
+      手动把"当前仍未被处理的单聊未读"以本人身份补发一条回复。
 强制实时模式（忽略继承来的 DRY_RUN=1），真正发送 + 推微信。
 
 用法：
@@ -14,13 +14,17 @@ import json
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dingtalk_unread_monitor as M
 
-# 强制实时：部署监控若继承了 DRY_RUN=1，这里覆盖掉，确保真正发送
-M.DRY_RUN = False
+# 强制实时：部署监控若继承了 DRY_RUN=1，这里覆盖掉，确保真正发送。
+# DRY_RUN 是 runtime 里的可变配置，子模块通过 runtime.DRY_RUN 读取，
+# 所以必须改 runtime 模块的属性本身才真正生效（仅设 M.DRY_RUN 是入口副本，不生效）。
+import runtime as _rt
+_rt.DRY_RUN = False
 
 
 def main():
-    print(f"[recover] DRY_RUN forced = {M.DRY_RUN} (live send ON)")
-    convs = M.get_unread()
+    print(f"[recover] DRY_RUN forced = {_rt.DRY_RUN} (live send ON)")
+    convs, _health = M.get_unread()  # health 不关心（手动补发，老板自己判断 dws 是否可用）
+    print(f"[recover] dws health: {_health}")
     print("[recover] unread convs:")
     print(json.dumps(convs, ensure_ascii=False)[:2000])
 
@@ -34,7 +38,7 @@ def main():
         msg = M.get_latest_msg(cid)
         sender = M.msg_field(msg, "sender", "senderName", "senderNick")
         content = M._as_text(M.msg_field(msg, "content", "text", "body", default=""))
-        sender_open_id = M.msg_field(msg, "senderOpenDingTalkId", "openDingTalkId", "fromOpenDingTalkId")
+        sender_open_id = M.extract_sender_open_id(msg)
         msg_id = M.msg_field(msg, "openMessageId", "messageId", "msgId")
 
         # —— 复用主脚本的图片处理逻辑（避免 mediaId 噪音喂给 AI / 图片消息退化成纯文本）——
@@ -49,6 +53,11 @@ def main():
             continue
         if not msg_id:
             print("[recover] 跳过：缺 msg_id，无法引用回复。")
+            continue
+
+        # 抢答防护：老板当前正活跃在该会话则跳过补发（手动工具也要避免抢老板话）
+        if M.owner_recently_active(cid):
+            print("[recover] 跳过：老板当前在该会话活跃，避免抢答。")
             continue
 
         # 下载图片（复用主脚本逻辑），用于看图代复
