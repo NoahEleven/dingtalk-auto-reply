@@ -15,6 +15,7 @@ agent_created: true
 ```
 dingtalk-auto-reply/
 ├── SKILL.md                      # 本说明
+├── README.md                     # 精简版介绍（特性 / 架构 / 安装 / 配置，随包分发）
 ├── .env.example                  # 配置样例（cp .env.example .env 后填写真实身份/Key）
 ├── .gitignore                   # 隐私黑名单（.env / _media_cache / .vbs 等不随包分发）
 ├── dingtalk_unread_monitor.py    # 入口（仅 docstring + main() + 统一 re-export；旧 import 兼容）
