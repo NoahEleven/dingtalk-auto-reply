@@ -54,7 +54,7 @@ dingtalk-auto-reply/
 ├── reply.py                      # 回复生成（人设 / grounding / SDK / 微信推送）
 ├── gen_launcher.py              # 启动器生成器（本机生成 Startup .vbs，不随包分发）
 ├── dingtalk-helper-backup.md    # 人设干净部署模板（无私人数据，换机兜底）
-├── _validate.py                  # 自测脚本（集成 / --inject / --test-guard / --test-construct / --test-statemachine / --env）
+├── _validate.py                  # 自测脚本（7 模式：集成 / --inject / --test-guard / --test-construct / --test-statemachine / --test-mcp / --env，不真发回复；--env 做环境预检）
 ├── _setup_env.py                 # 安装脚本：探测并写入 SDK 运行环境到 .env
 ├── recover_missed.py            # 漏发补发脚本（监控宕机/DRY_RUN 后手动补）
 └── stop_monitor.ps1             # 精确结束本脚本 python（Windows）
@@ -158,13 +158,14 @@ PY="$HOME/.workbuddy/binaries/python/envs/default/bin/python3"
 | `--test-guard` | 验证抢答防护（活跃检测 + 延迟窗口） |
 | `--test-construct` | 回归 prompt 构造（含 2026-07-30 burst 合并修复），monkey-patch 拦截 SDK，不耗积分 |
 | `--test-statemachine` | 验证延迟代发状态机纯函数（19 条断言，不依赖 dws/SDK） |
+| `--test-mcp` | 验证 gbrain MCP 工具链路（握手 / tools/list / search 返回 / prompt 注入），确认知识库通路就绪 |
 
 ---
 
 ## 🛡️ 健壮性要点
 
 - **心跳健康标记**：每 ~120s 打 `[heartbeat] alive, unread_now=N`（带 `empty` / `dws_unhealthy!` 区分真无未读 vs dws 坏了伪装健康）；连续失败自动推微信提醒。
-- **单实例锁**：`~/.workbuddy/dingtalk_auto.lock` 存 PID，重复启动自动退出，杜绝双发。
+- **单实例锁**：固定本地端口 `127.0.0.1:18733` 绑定（bind 成功者持有），重复启动自动退出，杜绝双发。
 - **启动 seed 不吞消息**：首轮记去重表（不 retro 历史），但 24h 内到达的单聊未读发一次被动微信提醒。
 - **失败不代发**：生成失败 / 质检拦截 / 媒体无文本 → 绝不发兜底话术，只推微信「需手动处理」。
 - **审计日志**：`~/.workbuddy/dingtalk_auto_audit.jsonl` 记录每次代发 / 跳过（高风险对外操作可追溯）。
