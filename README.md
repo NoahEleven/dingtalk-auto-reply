@@ -12,9 +12,12 @@
 - **单聊 AI 代复**：以本人身份、平级同事口吻自动回复，一人一会话、记忆连续。
 - **群聊只提醒不代发**：仅当被 `@我` / `@all` 时才推微信提醒，避免群聊社死。
 - **事实 grounding**：事实性问题强制先查 gbrain 知识库（失败回退本地文档），禁止凭印象乱答。
+- **agent 自调 dws 查同事记录**：同事问「跟 XX 对接了吗 / 进展」时，agent 自己用 Bash 调 `dws contact user search` + `list-by-sender` 翻真实聊天记录再答（few-shot 示例 `dws-reply-examples.md` 每次注入），不凭印象说"还没对接"。
+- **回复像老板真人**：直接说事实、不暴露查询动作、不客服腔、1-3 句；SDK 空返回自动重试 1 次。
 - **多模态**：群 `@我` 图片、单聊图片自动识别补全内容，与文本**同一 SDK 后端、零额外 Key**。
 - **抢答防护**：延迟窗口 + 老板活跃检测，老板在聊就先不插嘴。
 - **健壮性**：心跳健康标记、单实例锁、崩溃自愈看门狗、审计日志、去重、日志轮转。
+- **可观测**：`DEBUG_AGENT_TRACE=1` 时日志打 `[agent-trace]` 块，可看 agent 完整思考/工具调用/结果（流式输出）。
 - **可移植**：路径零硬编码用户名，整目录拷贝即迁移；代码不含任何真实身份隐私。
 
 ---
@@ -54,6 +57,7 @@ dingtalk-auto-reply/
 ├── reply.py                      # 回复生成（人设 / grounding / SDK / 微信推送）
 ├── gen_launcher.py              # 启动器生成器（本机生成 Startup .vbs，不随包分发）
 ├── dingtalk-helper-backup.md    # 人设干净部署模板（无私人数据，换机兜底）
+├── dws-reply-examples.md        # few-shot 示例：教 agent 调 dws 查同事记录 + 老板口吻（随包分发）
 ├── _validate.py                  # 自测脚本（7 模式：集成 / --inject / --test-guard / --test-construct / --test-statemachine / --test-mcp / --env，不真发回复；--env 做环境预检）
 ├── _setup_env.py                 # 安装脚本：探测并写入 SDK 运行环境到 .env
 ├── recover_missed.py            # 漏发补发脚本（监控宕机/DRY_RUN 后手动补）
