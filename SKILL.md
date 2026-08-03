@@ -54,7 +54,7 @@ dingtalk-auto-reply/
 | 依赖 | 作用 | 安装 / 修复 |
 |---|---|---|
 | **Python（default venv）** | 跑脚本的解释器；`codebuddy-agent-sdk` 必须装在这个 venv 里 | 用 venv python 跑本脚本：`%USERPROFILE%\.workbuddy\binaries\python\envs\default\Scripts\python.exe`（macOS/Linux 用 `.../bin/python3`）。裸 managed python / anaconda 不含 SDK，会 `_SDK_AVAILABLE=False` |
-| **codebuddy-agent-sdk** | 生成回复 + 图片识别的唯一后端（hy3 经此 SDK） | `venv_python -m pip install codebuddy-agent-sdk`（或 `pip install -r requirements.txt`） |
+| **codebuddy-agent-sdk** | 生成回复 + 图片识别的唯一后端（deepseek-v4-flash 经此 SDK） | `venv_python -m pip install codebuddy-agent-sdk`（或 `pip install -r requirements.txt`） |
 | **dws CLI** | 拉未读 / 发消息 / 通讯录 | 跑 `gen_launcher.py` 自动加入 PATH；`dws patch chmod` 授权 `chat.message:list` / `chat.message:send` / `contact:search` |
 | **codebuddy CLI** | SDK 底层起 prewarm server 用 | 随 WorkBuddy 安装；`CODEBUDDY_CMD` 路径见 `print_paths()` |
 | **node** | dws NODE-direct 路由需要 | 装 Node 并确保在可用路径 |
@@ -239,10 +239,10 @@ cd ~/.workbuddy/skills/dingtalk-auto-reply && python gen_launcher.py
 ## 生成回复（CodeBuddy Agent SDK 唯一后端 · 融合查表 grounding + 会话记忆）
 
 `gen_reply(sender, content, …)` 调度逻辑（**唯一后端 = CodeBuddy Agent SDK**，无 CLI 兜底）：
-- `_gen_reply_sdk_async`（**唯一**）：`CodeBuddyAgentOptions(extra_args={"agent":"dingtalk-helper"}  # 按名加载 codebuddy 注册灵魂 dingtalk-helper.md（人设真源）, system_prompt=AppendSystemPrompt(append=<查表数据，人设由 --agent 加载>), model=hy3, permission_mode=bypassPermissions, codebuddy_code_path=<managed codebuddy.cmd>, cwd=<钉钉自动回复工作空间，自动加载该空间记忆>, session_id/resume=dt_<cid>)`；用户消息走 `query` 干净单行（`f"{sender}：{content}"`），system_prompt 用追加模式保留工作空间记忆、用户消息天然分离（无命令行多行坑）。agent 未注册时 `extra_args={}` 且改为把 `dingtalk-helper-backup.md` 兜底注入 system_prompt。
+- `_gen_reply_sdk_async`（**唯一**）：`CodeBuddyAgentOptions(extra_args={"agent":"dingtalk-helper"}  # 按名加载 codebuddy 注册灵魂 dingtalk-helper.md（人设真源）, system_prompt=AppendSystemPrompt(append=<查表数据，人设由 --agent 加载>), model=deepseek-v4-flash, permission_mode=bypassPermissions, codebuddy_code_path=<managed codebuddy.cmd>, cwd=<钉钉自动回复工作空间，自动加载该空间记忆>, session_id/resume=dt_<cid>)`；用户消息走 `query` 干净单行（`f"{sender}：{content}"`），system_prompt 用追加模式保留工作空间记忆、用户消息天然分离（无命令行多行坑）。agent 未注册时 `extra_args={}` 且改为把 `dingtalk-helper-backup.md` 兜底注入 system_prompt。
   - 空闲 `SERVER__PORT` 注入 `env` 防 prewarm 端口冲突挂死（0 字节超时根因）。
-  - `env` 注入 `CODEBUDDY_INTERNET_ENVIRONMENT=internal`（中国版 hy3 路由）；`bypassPermissions` 放行后 agent 可自行调 `dws` 补查（事实 grounding 双保险）。
-  - 图片消息：`image_paths` 非空时以 Anthropic image 协议内联进 `query`（hy3 多模态「看图代复一次调用」）。
+  - `env` 注入 `CODEBUDDY_INTERNET_ENVIRONMENT=internal`（中国版 deepseek-v4-flash 路由）；`bypassPermissions` 放行后 agent 可自行调 `dws` 补查（事实 grounding 双保险）。
+  - 图片消息：`image_paths` 非空时以 Anthropic image 协议内联进 `query`（deepseek-v4-flash 多模态「看图代复一次调用」）。
 - **【主回复对象 vs 背景历史 · 2026-07-20 老板纠偏 + 2026-07-30 burst 合并修复】**：消息窗口内累积的 `messages` 列表**必须按时间倒序**（newest 在前，主循环已按 `_msg_ts` 排序+兜底 `sorted` 二次保护）。
   - **【2026-07-30 burst 合并 · 当前主路径】**：取最新对方消息 ts T0，窗口 `[T0 - REPLY_DELAY_SEC, T0]` 内（默认 120s）的对方连发消息**物理合并成一条虚拟主消息**（拼接格式 `[1/N] sender：content1\n[2/N] sender：content2\n...`，按时间正序呈现），作为 AI 的【主回复对象】。背景历史 = 窗口外对方消息 + 老板本人历史发言。AI 看到 main_content 直接就是"对方在延时窗口内连发的全部消息"，prompt 明确告知"请综合理解后给一条统一回复，覆盖核心诉求，不要漏答、不要逐条复述"。**比 prompt 软约束强**：物理合并让 AI 没法只挑最新一条答。
   - **【2026-07-20 旧设计 · single-main 模式 · 仍在使用】**：当窗口内对方消息仅 1 条时走此模式——`msgs[0]` = 对方最新一条 = AI 唯一要回的内容；`msgs[1:]` = 背景历史，仅供了解上下文。强约束"只回主消息、不要复述历史话题"。
@@ -318,7 +318,7 @@ cd ~/.workbuddy/skills/dingtalk-auto-reply && python gen_launcher.py
 - `download_images(...)`：调 `dws chat message download-media` 把图下到 `_media_cache/`（路径必须用 Windows 原生反斜杠绝对路径，否则底层 Go 组件误解析 `/c/` 导致落盘失败）。
 - `describe_image(path)` + `describe_images(paths)`：**复用 CodeBuddy Agent SDK 多模态**（与 `gen_reply` 同一后端、同一视觉模型；把图 base64 内联进 SDK query，实测可准确读出文字/颜色/图形，文本落在 `AssistantMessage/TextBlock`，抽取方式与 `gen_reply` 完全一致）。视觉模型默认跟随文本主模型（`CODEBUDDY_MODEL`），可用 `VISION_MODEL` 单独指定 CodeBuddy 侧视觉模型。返回中文描述。主要用于**群聊 @我 通知**和**单聊不代复时让老板知道图里是什么**。
 - 群聊：**仅 @我 时**识别（避免群刷图烧视觉额度），结果补进微信通知 `🖼️ 图片内容：XXX`（`describe_images` 1 次调用）。
-- 单聊**代复**：有图且 `AUTO_REPLY_IMAGE` 开启（默认开） → 把图以 image 协议**直接内联进 `gen_reply` 的 hy3 调用**（识别+代复 **1 次调用**完成，不再先 `describe` 再代复的二次调用）；失败/质量不达标仍走安全网不代发。单聊**不代复**（开关关，`AUTO_REPLY_IMAGE=0`）时则只走 `describe_images` 1 次拿描述补通知。
+- 单聊**代复**：有图且 `AUTO_REPLY_IMAGE` 开启（默认开） → 把图以 image 协议**直接内联进 `gen_reply` 的 deepseek-v4-flash 调用**（识别+代复 **1 次调用**完成，不再先 `describe` 再代复的二次调用）；失败/质量不达标仍走安全网不代发。单聊**不代复**（开关关，`AUTO_REPLY_IMAGE=0`）时则只走 `describe_images` 1 次拿描述补通知。
 
 **降级**：CodeBuddy Agent SDK 不可用（`_SDK_AVAILABLE=False`）→ `VISION_ENABLED=False` → 不识别、不下载图片，微信通知里图片只显示 `(图片/媒体消息)`，**不报错、不阻断**。只要 SDK 可用即开箱即用识别，无需任何 key。
 
@@ -445,13 +445,15 @@ nohup python ~/.workbuddy/skills/dingtalk-auto-reply/dingtalk_unread_monitor.py 
 
 ## 自测脚本 `_validate.py`
 
-4 种模式（参数互斥，按需选一）：
+7 种模式（参数互斥，按需选一）：
 
 - **默认集成验证**：打印所有外部二进制/人设的解析路径（DWS_EXE/DWS_ENTRY/DWS_CMD/NODE/CODEBUDDY_CMD/SEND_JS/SOUL_AGENT 等，确认可移植探测正确）。
 - **`--inject`**：手动注入一条假消息跑 `gen_reply`，把回复「发给自己」（`dws chat message send --open-dingtalk-id <自己>`），**绝不发给别人**；想去掉 DRY_RUN 后真发，方便验证生成效果。
 - **`--test-guard`**：验证抢答防护逻辑（活跃检测 `owner_recently_active` + 延迟窗口参数），不真发、不触碰任何人会话。自动探测真实单聊 cid，打印活跃检测结果并演示"进窗口→到期代发"（DRY_RUN 下只生成不真发）。
 - **`--test-construct`**：回归验证 `gen_reply` 的 prompt 构造（2026-07-20 老板纠偏 + 2026-07-30 burst 合并的关键修复点）。monkey-patch 拦截 SDK 调用，不真发、不耗积分。五个场景：①延时期内对方连发 5 条 → burst-merged 物理合并成 1 条主消息；②单条对方消息问进度 → single-main 模式 + 查表激活；③延时期内对方连发"问题反馈"+"测试" → burst 合并后 table_context 保留（旧"测试丢弃"已被 burst 替代）；④含老板历史发言 → burst 合并对方窗口消息 + 老板历史进背景；⑤跨窗口的"问题反馈"（时间差 > REPLY_DELAY_SEC）→ 不进 burst、当背景历史、不触发查表（防 07-20 旧 bug 复发）。
 - **`--test-statemachine`**：验证延迟代发状态机纯函数（`_pending_next_state` / `_pending_after_send` / `_gnotify_next_state` / `_gnotify_after_push`，定义在 `dingtalk_unread_monitor.py`）。不依赖 dws/SDK，纯逻辑断言。覆盖：PENDING/GNOTIFY 的「未到期+活跃→取消」「未到期+重试中不取消」「到期+dws未确认→defer」「defer超限→单聊转人工/群直推」「到期→代发/推送」「发送/推送失败<5次→重试」「失败达5次→放弃」，共 19 条断言。回归「监控主循环状态机偏重」的重构——抽纯函数后行为不变。
+- **`--test-mcp`**：验证 gbrain MCP 工具链路（initialize 握手 + tools/list 含 search/query + tools/call search 返回真实内容 + `gen_reply` system_prompt 注入 gbrain 指引），确认知识库通路就绪。
+- **`--env`（即 `--check-env`）**：仅做环境预检：核查 SDK / dws / codebuddy CLI / node / 视觉 / 人设 是否就位，逐项打印 `[OK]/[MISSING]/[WARN]`，阻断级缺失给精确修复命令并以退出码非 0 退出；不跑任何生成。
 
 每次自测必跑 **dws 实际调用比对**（默认开 `DEBUG_DWS_CALL=1`）：把「配置的路径（DWS_EXE/DWS_ENTRY/DWS_CMD/NODE 是否存在）」与「`run_dws` 实际选用的路由（DIRECT-exe / NODE-direct / DWS_CMD-fallback / NONE）」和「接口真实返回的字节长度 / 解析出的会话数」三者对齐打印，给 `PASS / WARN / FAIL` 结论；同时把每次 dws 调用的**真实 argv + 返回码 + stdout 长度**写进调试日志（`[dws-call]` / `[dws-route]` 行，数据抓取表现为 `[dws-file] OK out_len=N`）。三条路由输出统一走**文件重定向**（dws 对 PIPE 异步 flush 丢失、Python 读 PIPE 恒空，文件重定向是当前主力方案，与控制台/解释器无关）。排障"dws 找不到/调不通"时，先看这段比对 + 日志里的 argv，一眼定位是 PATH 缺失还是入口解析错。
 
@@ -461,7 +463,7 @@ nohup python ~/.workbuddy/skills/dingtalk-auto-reply/dingtalk_unread_monitor.py 
 
 ## 漏发补发脚本 `recover_missed.py`
 
-监控曾宕机、或历史某次以 `DRY_RUN=1` 启动过（只生成不真发）导致漏掉的单聊消息，用本脚本手动补发：拉取当前未读单聊 → 用 hy3 生成本人口吻回复 → **真正发送**并推微信通知。
+监控曾宕机、或历史某次以 `DRY_RUN=1` 启动过（只生成不真发）导致漏掉的单聊消息，用本脚本手动补发：拉取当前未读单聊 → 用 deepseek-v4-flash 生成本人口吻回复 → **真正发送**并推微信通知。
 
 ```bash
 # 补发所有漏掉的单聊未读（实时真发）
@@ -474,7 +476,7 @@ nohup python ~/.workbuddy/skills/dingtalk-auto-reply/dingtalk_unread_monitor.py 
 
 1. **dws CLI**（WorkBuddy 自带）：需授权 `chat.message:list`、`chat.message:send` 与 `contact:search`（后者用于获取本人 openid 以精确识别「回复自己」；用 `dws patch chmod` 授权）。
    - ⚙️ **必须在系统 PATH 上**（关键根因，勿漏）：机制与自动追加见上方「dws 依赖」段。
-2. **codebuddy CLI**（WorkBuddy managed node 目录自带）：SDK 的 `codebuddy_code_path` 指向其 `codebuddy.cmd`，SDK 内部 spawn 它来跑 agent；模型 `hy3`。
+2. **codebuddy CLI**（WorkBuddy managed node 目录自带）：SDK 的 `codebuddy_code_path` 指向其 `codebuddy.cmd`，SDK 内部 spawn 它来跑 agent；模型 `deepseek-v4-flash`。
 3. **codebuddy-agent-sdk**（Python SDK，**唯一后端**）：`pip install codebuddy-agent-sdk`。**必须装到运行脚本的 python 环境**——WorkBuddy managed python 的 default venv（Windows：`%USERPROFILE%\.workbuddy\binaries\python\envs\default\Scripts\python.exe -m pip install codebuddy-agent-sdk`；macOS/Linux：`$HOME/.workbuddy/binaries/python/envs/default/bin/python -m pip install codebuddy-agent-sdk`）。未装则 `gen_reply` 直接返回空（不代发），不会崩溃。
 4. **weixinclaw-proactive-push skill**（可选）：用于微信主动推送；未装则自动降级为仅日志。
 5. 人设真源 = codebuddy 注册 agent `dingtalk-helper.md`（全局 `~/.codebuddy/agents/`，不随 skill 打包）；skill 内 `dingtalk-helper-backup.md` 是其干净部署模板（占位，无私人数据；随 skill 走、换机兜底）。改人设只改 `dingtalk-helper.md` 一处。
@@ -484,4 +486,4 @@ nohup python ~/.workbuddy/skills/dingtalk-auto-reply/dingtalk_unread_monitor.py 
 技能目录自带 `.env.example`，移植到新机：`cp .env.example .env` 后按需填写。所有项均可选，留空=自动探测/默认。已存在的系统环境变量不被 `.env` 覆盖。
 
 - **CodeBuddy 认证**：见上方「运行」段的 ⚠️ CodeBuddy 认证（API Key 或 CLI 已登录二选一）。
-- **其他可配项**：`POLL_INTERVAL`(轮询秒)、`DRY_RUN=1`(只验证不真发)、`REPLY_DELAY_SEC`(延迟窗口秒,默认120)、`ACTIVE_WINDOW_SEC`(活跃窗口秒,默认300)、`GROUP_PUSH=atme|all|off`(群消息推微信策略,默认 `atme`)、`MENTION_NAMES`(群 @我 昵称候选,在私密 `.env` 配你的昵称)、`SKIP_SENDERS`(不代发名单)、`SELF_SENDERS`(本人昵称)、`AUTO_REPLY_IMAGE`(单聊图片代复开关,默认开)、`VISION_MODEL`(视觉模型,默认跟随文本主模型 `CODEBUDDY_MODEL` 即 hy3、可单独指定 CodeBuddy 侧视觉模型)、各二进制路径。全在 `.env.example` 有注释。
+- **其他可配项**：`POLL_INTERVAL`(轮询秒)、`DRY_RUN=1`(只验证不真发)、`REPLY_DELAY_SEC`(延迟窗口秒,默认120)、`ACTIVE_WINDOW_SEC`(活跃窗口秒,默认300)、`GROUP_PUSH=atme|all|off`(群消息推微信策略,默认 `atme`)、`MENTION_NAMES`(群 @我 昵称候选,在私密 `.env` 配你的昵称)、`SKIP_SENDERS`(不代发名单)、`SELF_SENDERS`(本人昵称)、`AUTO_REPLY_IMAGE`(单聊图片代复开关,默认开)、`VISION_MODEL`(视觉模型,默认跟随文本主模型 `CODEBUDDY_MODEL` 即 deepseek-v4-flash、可单独指定 CodeBuddy 侧视觉模型)、各二进制路径。全在 `.env.example` 有注释。
