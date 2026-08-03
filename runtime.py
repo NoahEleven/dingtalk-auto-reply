@@ -155,7 +155,7 @@ def _resolve_bin(explicit_env, subpath_no_ext, versioned_glob_no_ext=None):
 def _detect_china_edition():
     """检测是否为中国版（api.copilot.tencent.com）。
     CodeBuddy CLI 把网络环境标记存在 ~/.codebuddy/local_storage/ 下某个 entry 文件，
-    内容恰好是字符串 "internal"（已在本机确认：entry_3bab...info = "internal"）。
+    内容恰好是字符串 "internal"（已在本机确认：某个 entry_*.info = "internal"）。
     命中即中国版，生成时须注入 CODEBUDDY_INTERNET_ENVIRONMENT=internal，否则连不上。
     返回 True/False。"""
     try:
@@ -202,9 +202,9 @@ DWS_EXE = _resolve("DWS_EXE", None,
 CODEBUDDY_API_KEY = os.environ.get("CODEBUDDY_API_KEY", "")  # 来自 .env 或环境变量；空串=用 CLI 凭据
 # 中国版标记（auto 检测 ~/.codebuddy/local_storage 下 entry="internal"）
 CHINA_EDITION = _detect_china_edition()
-# 当前使用的 CodeBuddy 主模型（hy3）。SDK 调用统一从这里取，单一真实来源：
-# 环境变量 CODEBUDDY_MODEL 可覆盖（如切其它账户支持的模型），不配置则默认 hy3。
-CODEBUDDY_MODEL = os.environ.get("CODEBUDDY_MODEL", "hy3")
+# 当前使用的 CodeBuddy 主模型（deepseek-v4-flash）。SDK 调用统一从这里取，单一真实来源：
+# 环境变量 CODEBUDDY_MODEL 可覆盖（如切其它账户支持的模型），不配置则默认 deepseek-v4-flash。
+CODEBUDDY_MODEL = os.environ.get("CODEBUDDY_MODEL", "deepseek-v4-flash")
 
 # dws 实际调用追踪（测试/排查用）：DEBUG_DWS_CALL=1 时，每次 dws 调用都记录
 # 实际 argv（NODE-direct 还是 DWS_CMD 兜底）、返回码、stdout 长度 —— 便于把
@@ -457,10 +457,10 @@ AUDIT_LOG_MAX = 512 * 1024            # 审计日志上限 512KB，超出轮转
 
 
 # ---------- 图片识别（多模态）配置 ----------
-# 后端：与文本回复同一套 CodeBuddy Agent SDK（hy3 多模态），零额外 key、图片不出域。
-# 视觉模型默认跟随文本主模型 CODEBUDDY_MODEL（hy3 自带多模态，经 SDK image 协议读图）；
-# 如需单独指定 CodeBuddy 侧的视觉模型，用环境变量 VISION_MODEL 覆盖（仍是 CodeBuddy 模型，
-# 不是外部 OpenAI 兼容 API）。视觉能力与文本一致，统一由 SDK 可用性决定。
+# 后端：与文本回复同一套 CodeBuddy Agent SDK（deepseek-v4-flash 支持视觉，可看图识别），
+# 零额外 key、图片不出域。视觉模型默认跟随文本主模型 CODEBUDDY_MODEL，无需单独配置；
+# 如有特殊需要仍可用 VISION_MODEL 单独指定 CodeBuddy 侧视觉模型。
+# 视觉能力与文本一致，统一由 SDK 可用性决定。
 VISION_MODEL = os.environ.get("VISION_MODEL", CODEBUDDY_MODEL)
 # 「视觉能力」= SDK 可用即可（与文本生成同构），默认开箱即用识别，无需任何 key。
 VISION_ENABLED = _SDK_AVAILABLE
@@ -558,14 +558,14 @@ def build_sdk_env():
     return env
 
 
-# 视觉识别 prompt（hy3 内置视觉 / 外部 OpenAI 兼容 API 共用同一描述指令）。
+# 视觉识别 prompt（deepseek-v4-flash 内置视觉 / 外部 OpenAI 兼容 API 共用同一描述指令）。
 VISION_PROMPT = ("请用简体中文简明描述这张图片的关键信息"
                  "（如图表数据、文字内容、界面截图、物体等），不超过150字。")
 
 
 def _cli_credentials_present():
     """软检测 CodeBuddy CLI 是否已登录：~/.codebuddy/local_storage 下存在含
-    token/bearer/secret 凭据词的 entry 文件（已在本机确认 entry_2f0b / entry_d43e 含此类词）。
+    token/bearer/secret 凭据词的 entry 文件（已在本机确认存在多个 entry_*.info 含此类词）。
     这是 Electron IndexedDB 私有格式，不强依赖精确字段名——只做『凭据文件存在』的粗判，
     真正的硬保证是运行时 SDK query 本身（未登录会抛鉴权错误，被 gen_reply 捕获转不代发）。"""
     try:
