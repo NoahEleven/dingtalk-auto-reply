@@ -298,7 +298,7 @@ async def _gen_reply_sdk_async(persona, prompt, image_paths=None,
     编程式 system_prompt（无命令行编码/换行坑）、SDK 自管 stdio（无管道挂死）。
     返回原始回复文本（未走安全网净化）。
     坑：SERVER__PORT 端口冲突会导致 query() 0 字节超时 → 用空闲端口注入 env 规避。
-    image_paths 非空时，把图以 Anthropic image 协议内联进用户消息（hy3 多模态），
+    image_paths 非空时，把图以 Anthropic image 协议内联进用户消息（deepseek-v4-flash 多模态），
     实现「看图代复一次调用」——无需先 describe 再代复。
     session_id/resume：按会话隔离 + 续上下文（dt_<cid> 一人一会话，记忆连续）。
     cwd 固定钉钉工作空间 → 自动加载该空间记忆(.workbuddy/memory/MEMORY.md)；
@@ -627,7 +627,7 @@ def gen_reply(sender, content, image_desc="", image_paths=None, return_rejected=
 
 def extract_reply(text):
     """从 codebuddy 输出里稳当地取出「要发出的回复正文」。
-    hy3 偶发会进入"助手草稿模式"（给多个选项、反问是否要发），
+    deepseek-v4-flash 偶发会进入"助手草稿模式"（给多个选项、反问是否要发），
     用 <reply> 标签 + 兜底规则把真正的回复抽出来，避免把分析文本发到钉钉。"""
     t = (text or "").strip()
     if not t:
@@ -660,7 +660,7 @@ def extract_reply(text):
 
 def _looks_like_reply(text):
     """正向判据：这是一条正常的「老板回复」吗？
-    hy3 偶发会进入"助手草稿/角色扮演"模式输出废话（如 '小张：老板，明天的评审…'、
+    deepseek-v4-flash 偶发会进入"助手草稿/角色扮演"模式输出废话（如 '小张：老板，明天的评审…'、
     '老板，今天下午的会议能改到明天吗'），绝不能发到钉钉；正常反问同事
     （如"要不要我帮你查下?"）现已放行。返回 False 让调用方走安全兜底话术。"""
     if not text:
