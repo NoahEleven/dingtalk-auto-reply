@@ -135,7 +135,7 @@ def main():
     sdk_py = _detect_sdk_python()
     china = _detect_via_runtime(lambda rt: rt._detect_china_edition(), False)
     cmd = _detect_via_runtime(lambda rt: rt.CODEBUDDY_CMD, "")
-    model = os.environ.get("CODEBUDDY_MODEL", "hy3")
+    model = os.environ.get("CODEBUDDY_MODEL", "deepseek-v4-flash")
     print(f"[detect] SDK python            = {sdk_py or '(未找到)'}")
     print(f"[detect] 中国版(internal)      = {china}")
     print(f"[detect] codebuddy CLI          = {cmd or '(自动探测)'}")
