@@ -3,7 +3,7 @@
 > 钉钉未读监控 → AI 以本人身份代复 → 微信通知
 
 监控钉钉未读会话：单聊用 AI 以**本人口吻**自动回复（普通员工语气、平级回同事）；群聊 / 指定名单只发微信提醒（**不代发，防社死**）。
-回复生成、图片识别统一走 **CodeBuddy Agent SDK**（hy3），无需任何外部 API Key。
+回复生成、图片识别统一走 **CodeBuddy Agent SDK**（deepseek-v4-flash），无需任何外部 API Key。
 
 ---
 
@@ -141,7 +141,7 @@ PY="$HOME/.workbuddy/binaries/python/envs/default/bin/python3"
 | `ACTIVE_WINDOW_SEC` | 老板活跃窗口秒（默认 300） |
 | `GROUP_PUSH` | 群消息推微信策略：`atme`(默认) / `all` / `off` |
 | `AUTO_REPLY_IMAGE` | 单聊图片代复开关（默认开） |
-| `VISION_MODEL` | 视觉模型（默认跟随文本主模型 `CODEBUDDY_MODEL` 即 hy3，可单独指定） |
+| `VISION_MODEL` | 视觉模型（默认跟随文本主模型 `CODEBUDDY_MODEL` 即 deepseek-v4-flash，可单独指定） |
 | `TABLE_GROUNDING=0` | 关闭查表 grounding，纯人设代复（新用户推荐起步） |
 | `GBRAIN_GROUNDING` | gbrain 知识库开关（默认开） |
 | `DINGTALK_AGENT_DISALLOWED_TOOLS` | 危险工具黑名单（默认 `Write,Edit`，可覆盖） |
