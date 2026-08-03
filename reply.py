@@ -14,6 +14,7 @@ import runtime
 from runtime import (
     _SDK_AVAILABLE, _sdk_query, CodeBuddyAgentOptions, AppendSystemPrompt,
     AssistantMessage, TextBlock, ResultMessage,
+    ThinkingBlock, ToolUseBlock, ToolResultBlock,
     BOSS_UID, BOSS_NAME, BOSS_COMPANY, BOSS_TITLE, TABLE_GROUNDING, TEST_MODE,
     GBRAIN_GROUNDING, GBRAIN_MCP_URL, GBRAIN_MCP_TOKEN,
     FB_BASE, FB_TAB, FB_STATUS, FB_HANDLER, FB_SUMM,
@@ -58,6 +59,10 @@ SOUL_AGENT = "dingtalk-helper"
 _CODEBUDDY_AGENTS_DIR = os.path.join(os.path.expanduser("~"), ".codebuddy", "agents")
 SOUL_AGENT_FILE = os.path.join(_CODEBUDDY_AGENTS_DIR, f"{SOUL_AGENT}.md")
 PERSONA_BACKUP_FILE = os.path.join(_SKILL_DIR, "dingtalk-helper-backup.md")
+# ⚠️ 2026-08-03 老板要求：dws 查同事记录 few-shot 示例文件（每次调用注入 system_prompt，
+# 教 agent 遇到「对接/进展/记录」类问题时先调 dws 查真实记录再答，禁止偷懒凭印象）。
+# 文件用中性占位词（同事甲/小王），不含任何真实人名/隐私，可随包分发。
+DWS_EXAMPLES_FILE = os.path.join(_SKILL_DIR, "dws-reply-examples.md")
 _AGENT_REGISTERED = os.path.isfile(SOUL_AGENT_FILE)
 if _AGENT_REGISTERED:
     log_debug(f"[persona] 方案B 生效：人设真源=codebuddy agent '{SOUL_AGENT}' ({SOUL_AGENT_FILE})")
@@ -115,11 +120,24 @@ _MODE_LOCK = (
     "拿不准就先调 gbrain 查，查不到如实说\"这个我得查下资料确认，稍回你\"。\n"
     "  · 【调 gbrain 不违反'只输出回复'】调用 mcp__gbrain__search / mcp__gbrain__query 是工具调用，"
     "不会污染最终输出；模型中间步骤的 tool_use 不会展示给同事，只有 <reply>...</reply> 内的文本会发出。\n"
+    "【⚠️ 查同事聊天记录 · dws 命令行】若主消息提到【具体同事的人名】并涉及\"对接 / 进展 / 之前说过 / 谁负责 / 记录\""
+    "等需要翻聊天记录才能回答的问题（典型信号：\"对接 XX 了吗 / 跟 XX 说了吗 / XX 有反馈吗\"），"
+    "你【必须用 Bash 调 dws 命令行查该同事的聊天记录】拿到真实情况再回，不要凭空说\"我还没对接\"：\n"
+    "  · 先查该同事的 userId：`dws contact user search --query \"同事姓名\" --format json`（取 result[].userId）；\n"
+    "  · 再拉 TA 最近发来的消息：`dws chat message list-by-sender --sender-user-id <userId> --start \"YYYY-MM-DDT00:00:00+08:00\" --end \"YYYY-MM-DDT23:59:59+08:00\" --limit 20 --format json`"
+    "（时间窗按近 1~2 个月填，看 result.conversationMessagesList[].messages[].content / createTime）；\n"
+    "  · 查到了就基于真实记录回答——直接说事实（时间点 / TA 原话 / 谁在做），"
+    "绝不在回复里暴露'我查了记录'（真人不会说'我查了下聊天记录'，直接说'跟进了，X月X号跟 TA 聊过…'即可）；"
+    "命令失败 / 查不到则如实说\"这个我得查下确认，稍回你\"，绝不编造\"已对接 / 没对接\"。"
+    "dws 是命令行工具，Bash 调用与手动敲命令等价，属隐式检索步骤，不违反\"只输出回复\"。\n"
     "【只写不干】不要进入探索模式、不要给选项——可就关键细节反问同事确认，最终只输出回复本身。\n"
     "【身份红线】你是公司普通员工，不是领导：涉及花钱 / 采购 / 签约 / 录用 / 排期 / 金额等需本人拍板的事，"
     "不要擅自答应，改说\"这个我确认下再回你\"。绝不暴露你是 AI / 助理 / 机器人，绝不称呼对方为\"老板\""
     "（那是助理对你的昵称）；不主动向同事透露真实姓名 / 公司 / 城市 / 电话 / 邮箱等隐私，对方问起也含糊带过。\n"
-    "【语气】自然平实、1-3 句，像平时在工作群里和同事说话；别官腔、别命令式、别摆架子。\n"
+    "【语气 · 像老板真人，不是 AI 汇报】自然平实、1-3 句，像平时随手打字：直接说结论/事实，不解释过程、"
+    "不暴露查询动作（不说\"我查了记录/查询结果显示/根据聊天记录\"）；有判断有态度（该催就催\"我催下他\"、"
+    "该等就等\"他弄完我同步你\"）；别官腔、别客服腔（\"好的呢~\"\"收到亲\"\"您放心\"全禁）、别摆架子；"
+    "技术话题自然中英混排。\n"
     "【话题纪律】每次只针对【主回复对象】那一条消息回复。背景历史仅供理解上下文与模仿你的口吻，"
     "【绝不】把历史里已回复过的话题、已被处理过的事（如\"问题反馈表 / 项目进度\"跟进）主动带回当前回复；"
     "若主消息与历史无关，则完全忽略历史。\n"
@@ -352,11 +370,28 @@ async def _gen_reply_sdk_async(persona, prompt, image_paths=None,
         else:
             yield {"type": "user", "message": {"role": "user", "content": prompt}}
     chunks = []
+    # ⚠️ 2026-08-03 老板要求：agent 是流式输出，可观察完整思考/执行过程。
+    # 解析时除 TextBlock（最终回复）外，把 ThinkingBlock（思考）/ ToolUseBlock（工具名+入参）/
+    # ToolResultBlock（工具结果）也打进调试日志——排查「agent 到底调没调 dws / 查到了什么」时
+    # 直接看日志轨迹，不用猜。默认关（DEBUG_AGENT_TRACE=1 开启），避免常驻下刷屏。
+    _trace = os.environ.get("DEBUG_AGENT_TRACE") == "1"
+    _trace_buf = []
     async for message in _sdk_query(prompt=_prompt_iter(), options=options):
         if isinstance(message, AssistantMessage):
             for block in message.content:
                 if isinstance(block, TextBlock):
                     chunks.append(block.text)
+                elif _trace:
+                    if isinstance(block, ThinkingBlock):
+                        _trace_buf.append(f"[thinking] {block.thinking[:300]}")
+                    elif isinstance(block, ToolUseBlock):
+                        _trace_buf.append(f"[tool_use] {block.name} input={json.dumps(block.input, ensure_ascii=False)[:400]}")
+                    elif isinstance(block, ToolResultBlock):
+                        _trace_buf.append(f"[tool_result] {str(block.content or '')[:400]} is_error={block.is_error}")
+        elif _trace and isinstance(message, ResultMessage):
+            _trace_buf.append(f"[result] {str(getattr(message, 'result', ''))[:300]}")
+    if _trace and _trace_buf:
+        log_debug("[agent-trace]\n" + "\n".join(_trace_buf))
     return "".join(chunks).strip()
 
 
@@ -535,6 +570,11 @@ def gen_reply(sender, content, image_desc="", image_paths=None, return_rejected=
     if persona:
         parts.append(persona)
     parts.append(_MODE_LOCK)
+    # ⚠️ 2026-08-03 老板要求：dws 查同事记录 few-shot 示例（教 agent 先查再答，禁止偷懒）。
+    # 每次调用都注入，避免模型靠 prompt 软约束「选择性执行」（实测第一次会调 dws、第二次偷懒不调）。
+    _few = _read_soul(DWS_EXAMPLES_FILE)
+    if _few:
+        parts.append(_few)
     parts.append(build_knowledge_instruction())  # 知识库检索指令：与 gbrain 实际挂载状态一致
     if table_context:
         # ⚠️ 收紧：再校验一次主消息是否在问「进度/反馈」类问题。
@@ -588,6 +628,22 @@ def gen_reply(sender, content, image_desc="", image_paths=None, return_rejected=
             _gen_reply_sdk_async(sys_text, user_msg, image_paths=image_paths,
                                  session_id=session_id, resume=resume),
             timeout=_call_timeout))
+        # ⚠️ 2026-08-03 老板拍板：SDK 空返回自动重试 1 次。
+        # 空返回 = SDK 调用"成功"但模型侧没产出任何 TextBlock（后端抖动 / 只输出工具调用没给最终文本 /
+        # gbrain 链路瞬时中断），实测复现时 16s 快速返回空、rejected_len=0。属偶发，重试大概率成功。
+        # 重试时在用户消息尾部追加一句提示，要求直接输出 <reply> 正文，避免再次只给分析/工具调用过程。
+        if not raw:
+            log_debug("[gen_reply] SDK 空返回 -> 自动重试 1 次")
+            raw = asyncio.run(asyncio.wait_for(
+                _gen_reply_sdk_async(
+                    sys_text,
+                    user_msg + "\n（注意：上一次生成未返回有效内容，请直接输出 <reply>...</reply> 包裹的回复正文；不要只输出分析过程或工具调用过程。）",
+                    image_paths=image_paths, session_id=session_id, resume=resume),
+                timeout=_call_timeout))
+            if raw:
+                log_debug(f"[gen_reply] 重试成功，len={len(raw)}")
+            else:
+                log_debug("[gen_reply] 重试仍空返回 -> 转人工")
     except Exception as e:
         if isinstance(e, asyncio.TimeoutError) and not _agent_warmed:
             # 首次调用超时：几乎都是 codebuddy 仍在冷启动注册 agent（7~26min），并非真故障。
@@ -689,8 +745,11 @@ def _looks_like_reply(text):
     # ⚠️ 2026-07-27 老板再次放宽：此前 07-21 收紧后的"典型助理反问模式"
     # （想让我|要不要我|你希望我|你打算|我建议你|要我帮你|要我帮您…）现已允许代复——
     # 老板回同事本就会反问/主动提出帮忙，这类反问不再拦截，只拦真正的泄漏/角色错乱。
+    # ⚠️ 2026-08-03 修复：原正则含「示例」→ agent 查 dws 记录后回复「…示例展示的修改…」
+    # （正常业务词，宣传页/文档语境）被误判"示范输出"拦下（实测复现）。「示例」太宽泛，
+    # 删掉；模型若真输出"示例回复：…"仍会被 extract_reply 的 meta_prefix / <reply> 标签兜底。
     if re.search(r"(作为您的|我帮您|为您查询|需要我为您|我作为|"
-                 r"要我帮你拟|要我(去|帮)拟|消息：|发件人：|同事发|对方：|示例)", text):
+                 r"要我帮你拟|要我(去|帮)拟|消息：|发件人：|同事发|对方：)", text):
         return False
     # ⚠️ 凭印象答事实性问题拦截（2026-07-29 加）：当 agent 跳过 gbrain 直接凭记忆答规格/参数时，
     # 常出现"印象里 / 我记得 / 大概 / 应该是 / 出厂默认 / 印象中"等含糊词。
