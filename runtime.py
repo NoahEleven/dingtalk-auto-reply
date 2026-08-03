@@ -65,6 +65,9 @@ try:
     from codebuddy_agent_sdk import (
         query as _sdk_query, CodeBuddyAgentOptions, AppendSystemPrompt,
         AssistantMessage, TextBlock, ResultMessage,
+        # ⚠️ 2026-08-03 流式轨迹调试：思考/工具调用/工具结果 block（DEBUG_AGENT_TRACE=1 时
+        # reply.py 把它们打进日志，排查「agent 到底调没调 dws / 查到了什么」）
+        ThinkingBlock, ToolUseBlock, ToolResultBlock,
     )
     _SDK_AVAILABLE = True
 except ImportError:
@@ -73,6 +76,7 @@ except ImportError:
     _SDK_AVAILABLE = False
     _sdk_query = CodeBuddyAgentOptions = AppendSystemPrompt = None
     AssistantMessage = TextBlock = ResultMessage = None
+    ThinkingBlock = ToolUseBlock = ToolResultBlock = None
 
 # ---------- SDK 运行环境（显式声明，安装时由 _setup_env.py 写入 .env） ----------
 # 装了 codebuddy-agent-sdk 的 python 解释器绝对路径。skill 运行时若被错误的 python 拉起
@@ -547,7 +551,10 @@ def build_image_block(path):
 def build_sdk_env():
     """构造 CodeBuddy Agent SDK 调用所需环境变量：
     每次生成分配空闲端口避开 SERVER__PORT 冲突（否则 query() 0 字节超时）；
-    中国版自动注入 CODEBUDDY_INTERNET_ENVIRONMENT；有 API Key 则注入。"""
+    中国版自动注入 CODEBUDDY_INTERNET_ENVIRONMENT；有 API Key 则注入。
+    ⚠️ 2026-08-03 老板要求（agent 可自己调 dws 查同事记录）：把 dws/node 可执行目录
+    注入 PATH——SDK 子进程的 Bash 是独立环境，若不注入，agent 敲 `dws contact user
+    search` 会因 vendor 目录不在 PATH 而失败，只能凭印象答（实测复现：查不到→回"还没对接"）。"""
     env = {
         "SERVER__PORT": str(_free_port()),
         "CODEBUDDY_INTERNET_ENVIRONMENT": os.environ.get(
@@ -555,6 +562,15 @@ def build_sdk_env():
     }
     if CODEBUDDY_API_KEY:
         env["CODEBUDDY_API_KEY"] = CODEBUDDY_API_KEY
+    # 追加 dws(node_modules/vendor)、dws.cmd、node 所在目录到 PATH，保证 agent Bash 能直接敲 dws
+    _extra_dirs = []
+    for _p in (DWS_EXE, DWS_ENTRY, NODE, DWS_CMD):
+        if _p and os.path.exists(_p):
+            _d = os.path.dirname(os.path.abspath(_p))
+            if _d not in _extra_dirs:
+                _extra_dirs.append(_d)
+    if _extra_dirs:
+        env["PATH"] = os.pathsep.join(_extra_dirs + [os.environ.get("PATH", "")])
     return env
 
 
