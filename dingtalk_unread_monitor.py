@@ -32,7 +32,7 @@
 原单文件（1642 行）已按职责拆分为 4 个模块 + 本入口，便于维护：
   - runtime.py       基础/配置层：.env 加载、SDK 可用探测、路径探测、全部共享常量、日志/锁/缓存/审计/鉴权
   - dingtalk_api.py  钉钉交互层：dws 调用、未读/消息拉取、单聊·群@判定、图片下载、发送
-  - vision.py        多模态层：图片识别（hy3 内置 / 外部 OpenAI 兼容 API）
+  - vision.py        多模态层：图片识别（deepseek-v4-flash 内置 / 外部 OpenAI 兼容 API）
   - reply.py         回复生成层：persona / 查表 grounding / SDK 生成 / 微信推送
   - dingtalk_unread_monitor.py（本文件）入口：仅保留 docstring + main() + 统一 re-export
 本文件把上面各模块的名字 re-export 到自身命名空间，因此 `import dingtalk_unread_monitor as M`
