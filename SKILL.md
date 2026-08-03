@@ -444,6 +444,32 @@ nohup python ~/.workbuddy/skills/dingtalk-auto-reply/dingtalk_unread_monitor.py 
 | `auto-reply monitor started` | 新实例刚拉起 | 正常 |
 | 审计日志出现 `skip_reply` / `notify_only` | 主动跳过（老板活跃 / 群非@我 / 生成失败） | 设计内，非 bug |
 
+### 🧠 观察 agent 完整思考/执行过程（DEBUG_AGENT_TRACE=1，2026-08-03 新增）
+
+SDK 是**流式输出**——agent 每一步（思考 → 工具调用 → 工具结果 → 最终回复）都能完整看到。
+排查「agent 到底调没调 dws / 查到了什么 / 为什么回复不理想」时，不用猜，直接看轨迹：
+
+```bash
+# 自测时前缀环境变量（监控常驻期间开轨迹需重启监控生效）
+DEBUG_AGENT_TRACE=1 <venv_python> _validate.py --inject --sender 同事甲 --message "第二期更新你对接子墨了吗"
+```
+
+开启后，每次 SDK 生成会在 `~/.workbuddy/dingtalk_auto_debug.log` 打一段 `[agent-trace]` 多行块：
+
+```
+[18:17:28] [agent-trace]
+[thinking] 用户问的是…提到了具体同事人名"子墨"，并涉及"对接/进展"…
+[tool_use] Bash input={"command": "dws contact user search --query \"子墨\" --format json", ...}
+[tool_use] Bash input={"command": "dws chat message list-by-sender --sender-user-id …", ...}
+[thinking] 查到了真实记录：7月8号子墨说"好的 这个我弄一下"…
+[result] <reply>跟进了，7月8号跟子墨聊过…基本快好了。</reply>
+```
+
+- **block 类型**：`[thinking]`=思考过程、`[tool_use]`=工具名+入参、`[tool_result]`=工具返回、`[result]`=最终 `<reply>`。
+- **典型排查**：回复说"还没对接"但轨迹里没有 `[tool_use] dws contact…` → agent 偷懒没查；有 `tool_use` 但没 `tool_result` → dws 命令失败（多半 PATH 问题，见 runtime.build_sdk_env 的 PATH 注入）；有 `tool_result` 但回复没引用 → 口吻/约束问题。
+- **默认关**（常驻防刷屏）：环境变量 `DEBUG_AGENT_TRACE=1` 开启，用完整绝对路径 venv python 跑才生效。
+- **配合 few-shot**：`dws-reply-examples.md`（skill 内，随包分发）每次调用注入 system_prompt，教 agent「提到人名+对接/进展→先调 dws 查记录再答，回复像老板真人、不暴露查询动作」。
+
 ## 自测脚本 `_validate.py`
 
 7 种模式（参数互斥，按需选一）：
