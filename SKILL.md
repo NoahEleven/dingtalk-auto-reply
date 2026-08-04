@@ -212,7 +212,7 @@ skill 目录**自包含**、整目录拷走即可。需要明确的四类外部�
 | skill 本体 | `~/.workbuddy/skills/dingtalk-auto-reply/` | ✅ 整目录拷 | .py/.md/.env.example 全在里面 |
 | 人设灵魂 `dingtalk-helper.md` | skill 内 `dingtalk-helper-backup.md`（**模板**，占位符 `<...>`）| ⚠️ 模板≠真身 | `dingtalk-helper-backup.md` 是**干净模板**（userId/baseId/字段全为 `<...>` 占位，随包分发不含私人数据）。**不要盲目 `cp` 它去覆盖你本机已配置好的 `dingtalk-helper.md`**——那会把真身冲成模板。正确做法：要么直接编辑你本机的 `dingtalk-helper.md` 填自己的钉钉身份/表结构；要么全新机才 `cp dingtalk-helper-backup.md ~/.codebuddy/agents/dingtalk-helper.md` 后**再填真实数据**。不注册也会自动用模板兜底（纯人设代复）。 |
 | 工作空间 + cwd 记忆 | `DINGTALK_WORKSPACE/.workbuddy/`（agent 运行时自动加载） | ❌ **禁止迁移** | 工作空间由你手动 `mkdir`（默认路径可配 `DINGTALK_WORKSPACE`）；cwd 记忆由 agent 自己拉 dws 生成/**你移植**、**内含老板隐私**。全新机留空，agent 首次运行自动建空记忆并自行重建上下文，绝不随包分发。 |
-| 私密配置 `.env` | skill 内 `.env.example`（`.env` 已被 `.gitignore` 排除） | ⚠️ 不随分发 | 新机 `cp .env.example .env` 后填 `BOSS_UID`/`SELF_OPEN_ID` 等。 |
+| 私密配置 `.env` | skill 内 `.env.example`（`.env` 已被 `.gitignore` 排除） | ⚠️ 不随分发 | 新机 `cp .env.example .env` 后填 `BOSS_UID`/`SELF_OPENDINGTALK_ID` 等。 |
 
 > 路径可移植：`DINGTALK_WORKSPACE`、`BOSS_UID` 均支持环境变量覆盖（`runtime.py` 用 `os.environ.get` + `os.path.expanduser("~")`），换机用户名不同也不会硬编码失效；不设则用默认 `~/WorkBuddy/dingtalk_auto_reply`。
 
@@ -229,7 +229,7 @@ cp ~/.workbuddy/skills/dingtalk-auto-reply/dingtalk-helper-backup.md ~/.codebudd
 
 # 3) 私密配置（不随包分发，新机自建）
 cp ~/.workbuddy/skills/dingtalk-auto-reply/.env.example ~/.workbuddy/skills/dingtalk-auto-reply/.env
-#    # 编辑 .env 填 BOSS_UID / SELF_OPEN_ID / CODEBUDDY_API_KEY（如需）
+#    # 编辑 .env 填 BOSS_UID / SELF_OPENDINGTALK_ID / CODEBUDDY_API_KEY（如需）
 
 # 4) dws 入 PATH + 生成本机启动器（幂等，无需重登）
 cd ~/.workbuddy/skills/dingtalk-auto-reply && python gen_launcher.py
@@ -412,6 +412,24 @@ nohup python ~/.workbuddy/skills/dingtalk-auto-reply/dingtalk_unread_monitor.py 
 - 停止（Windows）：`stop_monitor.ps1`（精确结束本脚本 python，不动其它 python）。
 - 停止（macOS/Linux）：`pkill -f dingtalk_unread_monitor.py` 按 PID 杀。
 
+## 消息查找能力现状（2026-08-03 严谨验证，改查找逻辑前必读）
+
+跨单聊+群聊查找历史消息，**可靠手段 = 按人 / 按会话枚举**；**`+search-msg` 关键词全量搜索当前不可用**（见下证据）。
+
+| 需求 | 命令 | 状态 |
+|---|---|---|
+| 按人拉消息（含单聊+群聊） | `dws chat message list-by-sender --sender-user-id <userId> --start/--end` | ✅ **可靠，首选**（agent 查同事记录就用它） |
+| 枚举全部会话（含单聊+群聊） | `dws chat list-all-conversations --limit N` | ✅ 可靠（实测 15 个会话） |
+| 按会话拉消息 | `dws chat message list --group <cid> --time/--direction older` | ✅ 可靠 |
+| 按关键词全量搜索 | `dws chat +search-msg --query "词" --start/--end` | ❌ **接口在但当前不命中** |
+
+**`+search-msg` 不可用的验证证据（2026-08-03，已排除授权/数据缺失/时间窗）：**
+- 定向群搜「MS42DDC」「步进电机」（词确认 7/31 真实出现在该群，`list` 已拉到）→ `count=0`
+- 按发送者搜同事乙（确认 7/31 发过 2 条）→ `count=0`；对照 `list-by-sender` 同条件 → 命中 2 条
+- `--verbose` 全程无报错；`dws chat data-auth cross-org --all --ttl 24h` 授权后重测仍 0
+- `chat.message:search` / `chat.message:list` scope 授权尝试 → `unknown scope`（INVALID_SCOPE）
+- **结论**：疑似服务端全文索引未对当前账号开放/未覆盖单聊与历史消息。**勿再尝试用 `+search-msg` 做热路径**，按人查走 `list-by-sender` 即可。
+
 ## dws 依赖（必须满足，不依赖钉钉客户端）
 
 监控**只通过 `dws`（DingTalk Workspace CLI，WorkBuddy 连接器）** 读取未读、发送回复，
@@ -451,18 +469,18 @@ SDK 是**流式输出**——agent 每一步（思考 → 工具调用 → 工�
 
 ```bash
 # 自测时前缀环境变量（监控常驻期间开轨迹需重启监控生效）
-DEBUG_AGENT_TRACE=1 <venv_python> _validate.py --inject --sender 同事甲 --message "第二期更新你对接子墨了吗"
+DEBUG_AGENT_TRACE=1 <venv_python> _validate.py --inject --sender 同事甲 --message "第二期更新你对接同事丙了吗"
 ```
 
 开启后，每次 SDK 生成会在 `~/.workbuddy/dingtalk_auto_debug.log` 打一段 `[agent-trace]` 多行块：
 
 ```
 [18:17:28] [agent-trace]
-[thinking] 用户问的是…提到了具体同事人名"子墨"，并涉及"对接/进展"…
-[tool_use] Bash input={"command": "dws contact user search --query \"子墨\" --format json", ...}
+[thinking] 用户问的是…提到了具体同事人名"同事丙"，并涉及"对接/进展"…
+[tool_use] Bash input={"command": "dws contact user search --query \"同事丙\" --format json", ...}
 [tool_use] Bash input={"command": "dws chat message list-by-sender --sender-user-id …", ...}
-[thinking] 查到了真实记录：7月8号子墨说"好的 这个我弄一下"…
-[result] <reply>跟进了，7月8号跟子墨聊过…基本快好了。</reply>
+[thinking] 查到了真实记录：7月8号同事丙说"好的 这个我弄一下"…
+[result] <reply>跟进了，7月8号跟同事丙聊过…基本快好了。</reply>
 ```
 
 - **block 类型**：`[thinking]`=思考过程、`[tool_use]`=工具名+入参、`[tool_result]`=工具返回、`[result]`=最终 `<reply>`。
