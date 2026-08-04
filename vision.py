@@ -16,23 +16,16 @@ from runtime import (
     VISION_ENABLED, VISION_MODEL,
     log_debug, DISALLOWED_TOOLS, build_sdk_env, build_image_block, VISION_PROMPT,
 )
-# 保留本地别名：re-export 供 monitor / reply 经 `from vision import _vision_media_type` 调用
-from runtime import _vision_media_type
+
+# 单张图片识别超时（秒）：与文本生成同量级，防止异常图/大图卡死
+VISION_TIMEOUT = 120
 
 
 def describe_image(path):
     """识别单张图片，返回中文描述；失败/未配返回空串。
-    统一走 CodeBuddy Agent SDK（与文本回复同一后端、同一视觉模型 VISION_MODEL）。"""
+    统一走 CodeBuddy Agent SDK（与文本回复同一后端、同一视觉模型 VISION_MODEL）。
+    注：VISION_ENABLED == _SDK_AVAILABLE（runtime 定义），此处一次守卫即可。"""
     if not VISION_ENABLED:
-        return ""
-    return _describe_image_sdk(path)
-
-
-def _describe_image_sdk(path):
-    """复用 CodeBuddy Agent SDK（多模态）识别图片。把图以 Anthropic image 协议
-    塞进 SDK query，模型能准确读出文字/颜色/图形，文本落在 AssistantMessage/TextBlock。
-    视觉模型走 VISION_MODEL（默认跟随文本主模型，可经环境变量单独覆盖）。"""
-    if not _SDK_AVAILABLE:
         return ""
     async def _run():
         async def _img_msgs():
@@ -62,7 +55,7 @@ def _describe_image_sdk(path):
                         chunks.append(block.text)
         return "".join(chunks).strip()
     try:
-        return asyncio.run(asyncio.wait_for(_run(), timeout=120))
+        return asyncio.run(asyncio.wait_for(_run(), timeout=VISION_TIMEOUT))
     except Exception as e:
         log_debug(f"[vision] describe error: {e}")
         return ""
