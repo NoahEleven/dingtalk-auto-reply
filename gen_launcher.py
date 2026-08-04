@@ -34,12 +34,12 @@ VBS_CONTENT = r'''Option Explicit
 '      -> stuck (e.g. dws child hung / silent spin) -> kill + relaunch next cycle.
 ' ============================================================
 
-Dim WshShell, objFSO, objShell
+Dim objShell, objFSO
 Dim PROFILE, HOME_WB, SKILL_DIR, PY, PY_CMD, LOG, MAX_STALE_SEC, sCmd
 
-Set WshShell = CreateObject("WScript.Shell")
-Set objFSO  = CreateObject("Scripting.FileSystemObject")
+' 单个 WScript.Shell 实例（ExpandEnvironmentStrings / SpecialFolders / Run / CurrentDirectory 全用它）
 Set objShell = CreateObject("WScript.Shell")
+Set objFSO  = CreateObject("Scripting.FileSystemObject")
 
 ' Current user profile root -- use %USERPROFILE% env-var expansion
 '   (SpecialFolders("Profile") can return EMPTY in some WSH contexts,
@@ -64,7 +64,7 @@ MAX_STALE_SEC = 180   ' log stale > 180s = monitor stuck, kill + restart
 
 ' Run with the skill dir as CWD so .env resolves even if launched elsewhere
 On Error Resume Next
-WshShell.CurrentDirectory = SKILL_DIR
+objShell.CurrentDirectory = SKILL_DIR
 On Error GoTo 0
 
 Function IsRunning(img, cmdpart)
