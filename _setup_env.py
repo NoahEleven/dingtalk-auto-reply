@@ -24,6 +24,11 @@ _SKILL_DIR = os.path.dirname(os.path.abspath(__file__))
 _ENV_PATH = os.path.join(_SKILL_DIR, ".env")
 _ENV_EXAMPLE = os.path.join(_SKILL_DIR, ".env.example")
 
+# 复用 runtime.parse_env_text（解析 .env 的唯一实现），需先把 skill 目录加入 sys.path
+if _SKILL_DIR not in sys.path:
+    sys.path.insert(0, _SKILL_DIR)
+from runtime import parse_env_text
+
 
 def _candidate_pythons():
     """候选 python：受管 venv / versions 目录 + 当前解释器，去重保序。"""
@@ -64,31 +69,27 @@ def _detect_sdk_python():
     return ""
 
 
-def _detect_via_runtime(fn, default=""):
-    """安全地复用 runtime 的探测函数（避免重复实现）。"""
+def _load_runtime():
+    """导入 skill 内 runtime 模块（复用其探测逻辑/默认值，避免重复实现）。
+    返回 runtime 模块或 None（import 失败时降级为内置默认）。"""
     try:
         if _SKILL_DIR not in sys.path:
             sys.path.insert(0, _SKILL_DIR)
         import runtime as _rt
-        return fn(_rt)
+        return _rt
     except Exception:
-        return default
+        return None
 
 
 def _read_existing_env(path):
-    vals = {}
-    if os.path.exists(path):
+    """读取现有 .env 的 {KEY: VALUE}（复用 runtime.parse_env_text，消除重复解析）。"""
+    if not os.path.exists(path):
+        return {}
+    try:
         with open(path, encoding="utf-8") as f:
-            for line in f:
-                s = line.strip()
-                if not s or s.startswith("#") or "=" not in s:
-                    continue
-                k, v = s.split("=", 1)
-                k, v = k.strip(), v.strip()
-                if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
-                    v = v[1:-1]
-                vals[k] = v
-    return vals
+            return parse_env_text(f.read())
+    except Exception:
+        return {}
 
 
 def _write_env(entries, force=False):
@@ -132,10 +133,12 @@ def main():
     ap.add_argument("--check", action="store_true", help="只打印探测结果，不写文件")
     args = ap.parse_args()
 
+    _rt = _load_runtime()
     sdk_py = _detect_sdk_python()
-    china = _detect_via_runtime(lambda rt: rt._detect_china_edition(), False)
-    cmd = _detect_via_runtime(lambda rt: rt.CODEBUDDY_CMD, "")
-    model = os.environ.get("CODEBUDDY_MODEL", "deepseek-v4-flash")
+    # 复用 runtime 探测（缺省时降级内置默认）：中国版标记 / CLI 路径 / 主模型默认值
+    china = bool(_rt and _rt._detect_china_edition()) if _rt else False
+    cmd = (_rt.CODEBUDDY_CMD if _rt else "") or ""
+    model = (_rt.CODEBUDDY_MODEL if _rt else os.environ.get("CODEBUDDY_MODEL", "deepseek-v4-flash"))
     print(f"[detect] SDK python            = {sdk_py or '(未找到)'}")
     print(f"[detect] 中国版(internal)      = {china}")
     print(f"[detect] codebuddy CLI          = {cmd or '(自动探测)'}")
