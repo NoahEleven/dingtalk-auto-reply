@@ -12,7 +12,8 @@
 - **单聊 AI 代复**：以本人身份、平级同事口吻自动回复，一人一会话、记忆连续。
 - **群聊只提醒不代发**：仅当被 `@我` / `@all` 时才推微信提醒，避免群聊社死。
 - **事实 grounding**：事实性问题强制先查 gbrain 知识库（失败回退本地文档），禁止凭印象乱答。
-- **agent 自调 dws 查同事记录**：同事问「跟 XX 对接了吗 / 进展」时，agent 自己用 Bash 调 `dws contact user search` + `list-by-sender` 翻真实聊天记录再答（few-shot 示例 `dws-reply-examples.md` 每次注入），不凭印象说"还没对接"。
+- **本地代码库检索**：配置 `CODE_SEARCH_ROOTS` 后，agent 可检索本地源码回答「源码/接口/实现细节」类问题（话题名/节点名/参数名/launch 配置/具体 .py/.cpp 逻辑）；装有 search.py（rg+ctags 封装）时优先用它，未装回退 Grep/Glob/Read。
+- **agent 自调 dws 查同事记录**：同事问「跟 XX 对接了吗 / 进展」时，agent 自己用 Bash 调 `dws contact user search` + `list-by-sender` 翻真实聊天记录再答（few-shot 示例内联在 reply.py `_FEW_SHOT_EXAMPLES` 每次注入），不凭印象说"还没对接"。
 - **回复像老板真人**：直接说事实、不暴露查询动作、不客服腔、1-3 句；SDK 空返回自动重试 1 次。
 - **多模态**：群 `@我` 图片、单聊图片自动识别补全内容，与文本**同一 SDK 后端、零额外 Key**。
 - **抢答防护**：延迟窗口 + 老板活跃检测，老板在聊就先不插嘴。
@@ -78,6 +79,7 @@ dingtalk-auto-reply/
 | **codebuddy CLI** | SDK 底层起 prewarm server | 随 WorkBuddy 安装 |
 | **node** | dws NODE-direct 路由 | 装 Node 并在可用路径 |
 | **gbrain MCP（可选）** | 查表 / 知识库；不配则纯人设回复 | `GBRAIN_MCP_URL` / `GBRAIN_MCP_TOKEN`，缺省读 `~/.workbuddy/mcp.json` 的 `gbrain` 条目 |
+| **代码库检索（可选）** | 检索本地源码回答「源码/接口/实现细节」问题 | `.env` 填 `CODE_SEARCH_ROOTS`（分号分隔路径列表，不填=不启用）；`CODE_SEARCH_TOOL` 指向 search.py（默认自动探测 `~/.workbuddy/tools/code-search/search.py`，未装回退 Grep/Glob/Read） |
 | **SDK 运行环境声明（`.env`）** | 让 skill / agent 识别「用哪个 python 跑」 | 安装时跑 `_setup_env.py` 写入 `CODEBUDDY_SDK_PYTHON` 等 |
 
 > ⚠️ 裸 managed python / anaconda **不含 SDK**，会导致 `_SDK_AVAILABLE=False`。务必用装了 SDK 的 default venv python 跑。
@@ -148,6 +150,8 @@ PY="$HOME/.workbuddy/binaries/python/envs/default/bin/python3"
 | `VISION_MODEL` | 视觉模型（默认跟随文本主模型 `CODEBUDDY_MODEL` 即 deepseek-v4-flash，可单独指定） |
 | `TABLE_GROUNDING=0` | 关闭查表 grounding，纯人设代复（新用户推荐起步） |
 | `GBRAIN_GROUNDING` | gbrain 知识库开关（默认开） |
+| `CODE_SEARCH_ROOTS` | 本地代码库检索路径（分号分隔，不填=不启用） |
+| `CODE_SEARCH_TOOL` | search.py 检索工具路径（默认自动探测 `~/.workbuddy/tools/code-search/search.py`） |
 | `DINGTALK_AGENT_DISALLOWED_TOOLS` | 危险工具黑名单（默认 `Write,Edit`，可覆盖） |
 
 ---
