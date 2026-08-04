@@ -18,13 +18,13 @@
   DRY_RUN=1 python ~/.workbuddy/skills/dingtalk-auto-reply/_validate.py
 
   # 注入测试（DRY_RUN：只生成+展示"会发给自己"，不真发）
-  DRY_RUN=1 python _validate.py --inject --sender "测试同事-张三" --message "在高速，晚点回"
+  DRY_RUN=1 python _validate.py --inject --sender "测试同事-甲" --message "在高速，晚点回"
 
   # 注入测试（真发给自己：去掉 DRY_RUN，回复会真的出现在你自己的钉钉会话里）
-  python _validate.py --inject --sender "测试同事-张三" --message "在高速，晚点回"
+  python _validate.py --inject --sender "测试同事-甲" --message "在高速，晚点回"
 
   # 高级：想测 reply(带引用) 的真实命令形态，指定一个真实会话 id（会发到该会话，慎用于真人）
-  python _validate.py --inject --sender 张三 --message 你好 --cid "<openConversationId>"
+  python _validate.py --inject --sender 同事甲 --message 你好 --cid "<openConversationId>"
 
 说明：脚本随技能一起，路径用自身目录解析，可移植。
 """
@@ -113,7 +113,7 @@ def run_integration():
     if not target:
         print("\n[skip] 当前无单聊未读，跳过集成验证（群聊不代发，符合预期）")
         print("        想完整验证生成链路可用 --inject 模式：")
-        print("        python _validate.py --inject --sender 张三 --message 你好")
+        print("        python _validate.py --inject --sender 同事甲 --message 你好")
         return
 
     cid = target["openConversationId"]
@@ -298,7 +298,7 @@ def run_construct_test():
     print("\n" + "#"*78)
     print("# 场景 5：跨窗口的'问题反馈'→ 不进 burst、当背景历史、不触发查表")
     print("#"*78)
-    _WIN = int(os.environ.get("REPLY_DELAY_SEC", "120"))
+    _WIN = M.REPLY_DELAY_SEC  # 与 runtime 单一真源，不重复硬编码默认值
     _T0 = 1700000500  # 主消息锚点
     msgs5 = [
         # 对方最新一条 = 主消息（不含'问题反馈'，纯闲聊）
@@ -552,7 +552,7 @@ def run_statemachine_test():
 
     # ---- PENDING ----
     # 1) 未到期 + 老板活跃 → cancel
-    j = {"deadline": now + 100, "ts": 1.0, "sender": "张三"}
+    j = {"deadline": now + 100, "ts": 1.0, "sender": "同事甲"}
     a, nj = F._pending_next_state(j, now, True)
     check("PENDING 未到期+活跃=cancel", a == "cancel")
     check("PENDING 纯函数不改原 job.deadline", j["deadline"] == now + 100)
@@ -570,7 +570,7 @@ def run_statemachine_test():
     a, nj = F._pending_next_state(j, now, None)
     check("PENDING dws未确认+defers<3=defer", a == "defer" and nj["defers"] == 2 and nj["deadline"] == now + 20)
     # 6) 到期 + dws未确认(defers到上限) → giveup（转人工）
-    j = {"deadline": now - 1, "ts": 1.0, "defers": 3, "sender": "张三"}
+    j = {"deadline": now - 1, "ts": 1.0, "defers": 3, "sender": "同事甲"}
     a, nj = F._pending_next_state(j, now, None)
     check("PENDING dws未确认+defers超限=giveup", a == "giveup" and nj["defers"] == 4)
     # 7) 代发后 send成功 → done
