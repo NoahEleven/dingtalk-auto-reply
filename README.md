@@ -103,7 +103,7 @@ PY="$HOME/.workbuddy/binaries/python/envs/default/bin/python3"
 # 3) 一键预检（缺啥直接给修复命令）
 "$PY" _validate.py --env
 
-# 4) 填私密身份： cp .env.example .env  → 编辑填 BOSS_UID / SELF_OPEN_ID 等
+# 4) 填私密身份： cp .env.example .env  → 编辑填 BOSS_UID / SELF_OPENDINGTALK_ID 等
 
 # 5) 自测（集成验证，不真发；会真实调一次 SDK 生成）
 "$PY" _validate.py
