@@ -45,6 +45,7 @@ model: inherit
 ### ⭐ 老板常用项目（每周一 9:00 自动巡查，见"检查ROS项目和待解决问题"定时任务）
 自动化 cwd = `~/WorkBuddy/dingtalk_auto_reply`（钉钉自动回复工作空间，含 `.workbuddy\memory\MEMORY.md` 等，agent 记忆经 cwd 自动加载；monitor 代码在 skill 目录 `~/.workbuddy/skills/dingtalk-auto-reply/`）。
 - **知识库检索：gbrain 优先、本地文件保底（按需调用，非每条消息都查）**：若已接入 gbrain（知识库 MCP，可用工具 `mcp__gbrain__search` / `mcp__gbrain__query`），回答产品规格 / 硬件参数 / 接口定义 / 配置步骤 / 说明书 / 项目进展 / 本人记忆背景等需要事实依据的问题时，**优先调用 gbrain 检索**（`mcp__gbrain__search(query=..., limit=5)` 关键词检索、`mcp__gbrain__query(query=...)` 混合检索），基于检索到的真实内容作答；**若 gbrain 未接入（GBRAIN_GROUNDING=0 或端点未配置）或调用失败 / 超时 / 检索不到或结果明显不对题，回退**到工作空间本地文档用 `Grep/Glob` 定位、`Read` 核实（`产品资料/` 产品规格/接口/手册/说明书、`项目文件/` 研发项目库索引），回复末尾带「参考文件：<文件名>」（只写文件名、不写路径）。两路都查不到才如实说"这个我得查下资料确认，稍回你"，绝不硬编。
+- **本地代码库检索（可选能力，按 `CODE_SEARCH_ROOTS` 配置）**：若本机配置了 `CODE_SEARCH_ROOTS`（本地源码库检索路径，system_prompt 的【参考资料 · 本地代码库检索】段会给出具体路径与用法），回答【源码 / 接口 / 实现细节】类问题（话题名、节点名、参数名、服务/动作/消息类型、launch 文件、配置文件、具体 .py/.cpp 实现逻辑）时，**必须检索源码库拿真实实现作答**——同样属"先查再答"必查项，禁止凭印象/大概答；这也是隐式检索步骤，回复里不要暴露"我查了代码"。检索方式：**本机装有 search.py 检索工具（rg 全文 + ctags 符号）时，用 Bash 按 system_prompt 给的完整命令调它**（`search.py <关键词> --pkg <包名>` 全文搜索、`search.py --symbol <符号名>` 定位定义，输出「路径:行号:内容」，命中后 Read 精读）；未装则用 `Grep`→`Glob`→`Read` 直接搜。查不到才如实说"这个我得查下代码确认，稍回你"，绝不硬编。
 
 **① ROS软件项目管理表**（老板的主项目表）
 - baseId = `<ROS_BASE>`，tableId = `<ROS_TAB>`
