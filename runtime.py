@@ -301,6 +301,45 @@ if not _GB_URL or not _GB_TOKEN:
 GBRAIN_MCP_URL = _GB_URL
 GBRAIN_MCP_TOKEN = _GB_TOKEN
 
+# 本地代码库检索路径（可选能力，通用配置，不绑定任何特定项目/型号）。
+# 分号(;)分隔的绝对路径列表；配置后，回复 agent 可检索这些源码库，
+# 回答「源码 / 接口 / 实现细节」类问题（话题名、节点名、参数名、launch/配置文件、
+# 具体 .py/.cpp 实现逻辑等），与 gbrain 文档知识互补（gbrain 查文档、代码库查实现）。
+# 通用 skill 设计：源码零硬编码真实路径，由部署者在 .env 的 CODE_SEARCH_ROOTS 填写
+# （Windows 用反斜杠或正斜杠均可）；未配置/路径不存在 → 不注入检索指令（防悬空）。
+CODE_SEARCH_ROOTS_RAW = os.environ.get("CODE_SEARCH_ROOTS", "")
+
+# 代码检索工具 search.py（可选，rg 全文搜索 + ctags 符号定位的封装脚本）。
+# 优先用该工具检索（比裸 Grep 全库扫更快更准，还支持 --pkg 限定包、--symbol 定位符号定义）；
+# 未配置/不存在时自动回退「Grep/Glob/Read 直接搜」。默认自动探测本机安装位置，可经
+# CODE_SEARCH_TOOL 环境变量覆盖（装到其它路径/机器时配置）。
+CODE_SEARCH_TOOL_RAW = os.environ.get(
+    "CODE_SEARCH_TOOL",
+    os.path.join(os.path.expanduser("~"), ".workbuddy", "tools", "code-search", "search.py"))
+
+
+def code_search_roots():
+    """返回【实际存在】的代码检索根路径列表（过滤不存在的，防悬空指令）。
+
+    与 build_knowledge_instruction 同思路：prompt 指令与实际可用性严格一致——
+    路径存在才写进 system_prompt 让 agent 去检，不存在/未配置则整段不注入。
+    """
+    _roots = []
+    for _r in CODE_SEARCH_ROOTS_RAW.split(";"):
+        _r = _r.strip()
+        if _r and os.path.isdir(_r):
+            _roots.append(_r)
+    return _roots
+
+
+def code_search_tool():
+    """返回【实际存在】的 search.py 检索工具路径；未安装返回 None（回退 Grep/Glob 直接搜）。"""
+    _t = (CODE_SEARCH_TOOL_RAW or "").strip()
+    if _t and os.path.isfile(_t):
+        return _t
+    return None
+
+
 # CodeBuddy Agent SDK 生成回复超时（秒）。
 # 常规调用 240s 足够；但 agent 首次被 --agent 加载时，codebuddy 有一次性的冷启动注册延迟
 # （实测 7~26 分钟），硬编码 240s 会让「注册后首条真实消息」在 240s 超时 -> 静默转人工、不代发。
