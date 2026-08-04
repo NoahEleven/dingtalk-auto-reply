@@ -36,38 +36,32 @@
   - reply.py         回复生成层：persona / 查表 grounding / SDK 生成 / 微信推送
   - dingtalk_unread_monitor.py（本文件）入口：仅保留 docstring + main() + 统一 re-export
 本文件把上面各模块的名字 re-export 到自身命名空间，因此 `import dingtalk_unread_monitor as M`
-的旧调用方（_validate.py / test_grounded_reply.py / recover_missed.py）无需改动。
+的旧调用方（_validate.py / recover_missed.py）无需改动。
 """
-import os, sys, time, json, re, asyncio, datetime, signal
+import os, sys, time, json, re, datetime
 import runtime  # 用于运行时修改 runtime.SELF_OPEN_ID 等可变配置
+# 注：以下 import 里含「兼容 re-export」——_validate.py / recover_missed.py 经
+# `import dingtalk_unread_monitor as M` 访问这些名字（M.DWS_CMD / M.gen_reply 等）。
+# 删名字前请先确认这两个外部脚本没有用 M.<name>。
 from runtime import (
-    CREATE_NO_WINDOW, _SDK_AVAILABLE, VISION_ENABLED, TEST_MODE, ONCE,
-    TABLE_GROUNDING, AUTO_REPLY_IMAGE, REPLY_DELAY_SEC, SELF_OPEN_ID,
+    VISION_ENABLED, TEST_MODE, ONCE,
+    AUTO_REPLY_IMAGE, REPLY_DELAY_SEC, ACTIVE_WINDOW_SEC, DRY_RUN,
     POLL_INTERVAL, check_codebuddy_auth, print_auth_banner, log_debug, _acquire_lock,
     _release_lock, _SKILL_DIR, NOTIFIED, PENDING, LAST_SELF_SENT, AUDIT_LOG, AUDIT_LOG_MAX,
-    GROUP_PUSH, SKIP_SENDERS, SELF_SENDERS, FALLBACK_REPLY, _RECENT_CACHE, save_state,
+    GROUP_PUSH, SKIP_SENDERS, FALLBACK_REPLY, _RECENT_CACHE, save_state,
     log_audit, _clean_media_cache, DWS_CMD, CODEBUDDY_CMD, NODE, SEND_JS, GNOTIFY,
-    DWS_ENTRY, DWS_EXE, CHINA_EDITION, CODEBUDDY_API_KEY, CODEBUDDY_MODEL, MEDIA_CACHE_DIR,
-    DEBUG_LOG, DEBUG_LOG_MAX, LOCK_FILE, STATE_FILE, BOSS_UID, DINGTALK_WORKSPACE,
-    _DWS_CALL_TRACE, MENTION_NAMES, _AT_RE, _MEDIA_RE, _PIC_TAG_RE,
-    _DWS_HINT_RE, _DWS_HINT_RE2,
+    DWS_ENTRY, DWS_EXE, CHINA_EDITION, CODEBUDDY_API_KEY,
 )
 from dingtalk_api import (
-    run_dws, _dws_ok, msg_field, extract_sender_open_id, _msg_ts, get_unread, get_latest_msg, _fetch_recent,
-    find_single_conversation, _as_text, _is_self, group_msg_is_at_me,
+    run_dws, msg_field, extract_sender_open_id, msg_sender_open_id, _msg_ts,
+    get_unread, get_latest_msg, _fetch_recent,
+    find_single_conversation, owner_recently_active, _as_text, _is_self, group_msg_is_at_me,
     extract_media_ids, clean_text_for_ai, download_images, send_reply, get_self_openid,
     send_reply_self,
 )
-from vision import (
-    _vision_media_type, describe_image, _describe_image_sdk,
-    describe_images,
-)
+from vision import describe_images
 from reply import (
-    detect_table_intent, _clean_md, _format_feedback, _format_project,
-    fetch_table_context, _gen_reply_sdk_async, gen_reply, extract_reply, _looks_like_reply,
-    push_weixin, _seed_notify, FB_BASE, FB_TAB, FB_STATUS, FB_HANDLER, FB_SUMM,
-    ROS_BASE, ROS_TAB, ROS_PROG, ROS_OWNER, ROS_NAME, _TABLE_CACHE, _TABLE_CACHE_TTL,
-    SESSION_RESUMED, _resolve_persona, _read_soul,
+    gen_reply, push_weixin, _seed_notify, SESSION_RESUMED,
 )
 
 
@@ -86,15 +80,30 @@ def _resolve_open_id(msgs):
     # 极端情况下兜底误取老板本人 openId → "回复自己"风险。
     _self = runtime.SELF_OPEN_ID or ""
     for m in msgs:  # msgs 已 newest-first
-        soid = m.get("sender_open_id") or extract_sender_open_id(m)
+        soid = msg_sender_open_id(m)
         if soid and soid != _self:
             return soid
     # 极端兜底：上面没命中（全是老板本人消息）→ 任取一个非空
     for m in msgs:
-        soid = m.get("sender_open_id") or extract_sender_open_id(m)
+        soid = msg_sender_open_id(m)
         if soid:
             return soid
     return ""
+
+
+def _download_imgs(media_ids, msg_id, cid, need_image):
+    """need_image 且（有图 + 视觉可用 + 非 DRY_RUN）时下载图片到缓存，
+    返回 [(local_path, ok)]；否则返回 []。单聊/群聊共用（消除两处重复的下载条件判断）。"""
+    if not (need_image and media_ids and VISION_ENABLED and not runtime.DRY_RUN):
+        return []
+    return [p for p, ok in download_images(media_ids, msg_id, cid) if ok]
+
+
+def _desc_paths(img_paths):
+    """识别已下载图片，返回中文描述（无图 / DRY_RUN 时返回空串）。"""
+    if not img_paths or runtime.DRY_RUN:
+        return ""
+    return describe_images([(p, True) for p in img_paths])
 
 
 # ---------- 延迟代发状态机（纯函数，可单测；单测见 _validate.py --test-statemachine） ----------
@@ -203,10 +212,9 @@ def _gnotify_after_push(job, push_ok, now):
 #   → 会话「不在」未读列表 = 已读 = 活跃(取消代发)
 #   → 会话「仍在」未读列表 = 未读 = 不活跃(到点代发)
 # 全程不拉聊天内容，故不受 list_conversation_message_v2 权限被拒影响。
-    # 仅当本轮回拉可靠(ok/empty)才采信结果；dws glitch 空列表(今天 16:24 实测)返回 None，
-    # 避免误杀待发任务。
-    # 注：内存二次确认 owner_recently_active_from_msgs 已于 2026-07-28 作为死代码移除，
-    # 活跃判定仅走未读信号单路。
+# 仅当本轮回拉可靠(ok/empty)才采信结果；dws glitch 空列表(16:24 实测)返回 None，避免误杀待发任务。
+# 注：内存二次确认 owner_recently_active_from_msgs 已于 2026-07-28 作为死代码移除，
+# 活跃判定仅走未读信号单路。
 def _owner_active_now(cid, seen_unread, unread_reliable):
     """返回老板活跃状态：
       True  = 已读/活跃 → 取消代发
@@ -571,16 +579,13 @@ def main():
                             log_debug(f"[pending] accumulate error: {_e}")
                         continue
                     # 单聊图片：下载（每条新消息只做一次）；是否识别取决于场景
-                    img_paths = []
-                    if media_ids and VISION_ENABLED and not runtime.DRY_RUN:
-                        img_paths = [p for p, ok in download_images(media_ids, msg_id, cid) if ok]
-                    want_auto_image = bool(media_ids and VISION_ENABLED and AUTO_REPLY_IMAGE and img_paths)
+                    img_paths = _download_imgs(media_ids, msg_id, cid, True)
+                    # img_paths 非空 ⇒ 已有图且视觉可用，无需再重复判 media_ids/VISION_ENABLED
+                    want_auto_image = bool(AUTO_REPLY_IMAGE and img_paths)
                     # 纯空（无文字、无图）或图片代复关闭 → 转人工
                     if not has_text and not want_auto_image:
-                        # 不代复场景：仍让老板知道图里是什么 → describe 识别一次（仅通知，省去代复的二次调用）
-                        img_desc = ""
-                        if img_paths and not runtime.DRY_RUN:
-                            img_desc = describe_images([(p, True) for p in img_paths])
+                        # 不代复场景：仍让老板知道图里是什么 → 识别一次（仅通知，省去代复的二次调用）
+                        img_desc = _desc_paths(img_paths)
                         pic_line = f"\n📷 图片内容：{img_desc}\n" if img_desc else ""
                         reason = ("图片消息（已识别内容，但单聊图片自动代复已关闭）"
                                   if (media_ids and VISION_ENABLED)
@@ -610,13 +615,9 @@ def main():
                 else:
                     # 群聊 / skip 名单 / 缺 msg_id：仅通知，不代发
                     at_me = (not is_single) and group_msg_is_at_me(content or body)
-                    # 群聊图片：仅在 @我 时识别（避免群刷图烧视觉额度），仅通知用
-                    img_paths = []
-                    if at_me and media_ids and VISION_ENABLED and not runtime.DRY_RUN:
-                        img_paths = [p for p, ok in download_images(media_ids, msg_id, cid) if ok]
-                    img_desc = ""
-                    if img_paths and not runtime.DRY_RUN:
-                        img_desc = describe_images([(p, True) for p in img_paths])
+                    # 群聊图片：仅在 @我 时下载+识别（避免群刷图烧视觉额度），仅通知用
+                    img_paths = _download_imgs(media_ids, msg_id, cid, at_me)
+                    img_desc = _desc_paths(img_paths)
 
                     if is_single:
                         # 单聊（skip 名单 / 缺 msg_id）：照常通知老板
