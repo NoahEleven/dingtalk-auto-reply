@@ -22,11 +22,16 @@ from runtime import (
 )
 
 
-def _run_dws_via_file(cmd, env, timeout):
-    """用临时文件承接 dws stdout —— 当前唯一定型执行方式（非兜底）。
-    原理：subprocess.run(stdout=file_handle) 让 dws 直接写文件，绕过 Node 对 PIPE 的
-    异步 flush 丢失。文件 I/O <1ms，相比 dws 网络往返 ~500ms 可忽略。
-    返回 stdout 字符串；失败返回 None。"""
+def _run_dws_once(cmd, env, timeout):
+    """执行一次 dws 子进程，返回 stdout 字符串；失败返回 None（供上层路由降级）。
+
+    唯一定型方案：文件重定向（2026-07-15 石锤 + 重启验证）。
+    dws.exe 为 Node 打包二进制，process.stdout 对匿名管道（PIPE）异步写、进程退出前未
+    flush → 管道读到 0 字节；与父进程是否控制台无关（python.exe console 环境重启后仍复现）。
+    故一律用临时文件承接 stdout（subprocess.run(stdout=file) → dws 同步落盘 → read），
+    彻底规避 PIPE 异步丢失。不再尝试 PIPE，不再保留降级标志。"""
+    if _DWS_CALL_TRACE:
+        log_debug("[dws-call] argv=" + " ".join(cmd))
     fd, tmp_path = _tempfile.mkstemp(suffix=".json", prefix="dws_out_")
     os.close(fd)  # 关闭 fd，用 open() 重新打开以控制编码
     try:
@@ -49,19 +54,6 @@ def _run_dws_via_file(cmd, env, timeout):
             os.unlink(tmp_path)
         except Exception:
             pass
-
-
-def _run_dws_once(cmd, env, timeout):
-    """执行一次 dws 子进程，返回 stdout 字符串；失败返回 None（供上层路由降级）。
-
-    唯一定型方案：文件重定向（2026-07-15 石锤 + 重启验证）。
-    dws.exe 为 Node 打包二进制，process.stdout 对匿名管道（PIPE）异步写、进程退出前未
-    flush → 管道读到 0 字节；与父进程是否控制台无关（python.exe console 环境重启后仍复现）。
-    故一律用临时文件承接 stdout（subprocess.run(stdout=file) → dws 同步落盘 → read），
-    彻底规避 PIPE 异步丢失。不再尝试 PIPE，不再保留降级标志。"""
-    if _DWS_CALL_TRACE:
-        log_debug("[dws-call] argv=" + " ".join(cmd))
-    return _run_dws_via_file(cmd, env, timeout)
 
 
 def run_dws(args, timeout=30):
@@ -138,6 +130,13 @@ def extract_sender_open_id(msg, default=""):
     return msg_field(msg, "senderOpenDingTalkId", "openDingTalkId", "fromOpenDingTalkId", default=default)
 
 
+def msg_sender_open_id(m):
+    """取消息的 sender_open_id：优先取已归一化的 m['sender_open_id'] 字段
+    （monitor 累积阶段写入），否则现抽原始字段。monitor._resolve_open_id 与
+    累积逻辑共用，消除两处重复的 `m.get("sender_open_id") or extract_sender_open_id(m)`。"""
+    return m.get("sender_open_id") or extract_sender_open_id(m)
+
+
 def _msg_ts(m):
     """把消息的时间字段解析成可排序的时间戳（epoch 秒），解析失败退化为 0。
     用真实时间排序比字符串排序稳（避免时间格式变化导致排序错乱）。"""
@@ -195,30 +194,38 @@ def get_unread():
         return [], "fail"
 
 
-def get_latest_msg(conv_id):
-    """用 openConversationId 拉该会话最新一条消息。
-    关键：必须带 --direction older，含义是「从给定时间往更早方向拉」，
-    配合 --time=now 即返回「从现在往前」的最新消息、且 newest-first。
-    早期版本漏了 direction，默认 older 又配合错误的起始时间，
-    会把位于起始时间之后（更新）的未读消息过滤掉 → 拉空。现固定用 --time now。
-    加固：dws `list` 端点偶发限流会静默返回空，做一次 3s 退避重试。"""
-    # 时间上界推到「现在+10s」：dws list --direction older --time T 仅返回 T 之前(older)的消息；
-    # 若 T=now(秒级截断)，落在 now 那一秒内的消息会被严格上界排除 → get_latest_msg 偶发返回「上一条」。
-    # 推到未来余量可保证边界消息必在窗口内，取到真正最新一条（修复「转发内容串到上一条」）。
+def _list_msgs_args(conv_id, n):
+    """构造 `chat message list` 拉最近 n 条消息的 dws 参数（get_latest_msg / _fetch_recent 共用）。
+    关键：必须带 --direction older，含义是「从给定时间往更早方向拉」；配合 --time now
+    即返回「从现在往前」的最新消息、newest-first。
+    时间上界推到「现在+10s」：dws list --direction older --time T 仅返回 T 之前(older)的消息；
+    若 T=now(秒级截断)，落在 now 那一秒内的消息会被严格上界排除 → 偶发返回「上一条」。
+    推到未来余量可保证边界消息必在窗口内，取到真正最新一条（修复「转发内容串到上一条」）。"""
     _t = datetime.datetime.now() + datetime.timedelta(seconds=10)
     tstr = _t.strftime("%Y-%m-%d %H:%M:%S")
-    args = ["chat", "message", "list", "--group", conv_id, "--time", tstr,
-            "--direction", "older", "--limit", "5", "--format", "json"]
+    return ["chat", "message", "list", "--group", conv_id, "--time", tstr,
+            "--direction", "older", "--limit", str(n), "--format", "json"]
+
+
+def _parse_msgs(out):
+    """解析 dws list 返回，得到按时间倒序的消息列表（newest-first）；失败返回 None。"""
+    try:
+        data = json.loads(out)
+        msgs = data.get("result", {}).get("messages", []) or []
+        return sorted(msgs, key=_msg_ts, reverse=True)
+    except Exception:
+        return None
+
+
+def get_latest_msg(conv_id):
+    """用 openConversationId 拉该会话最新一条消息（newest-first 取第一条）。
+    加固：dws `list` 端点偶发限流会静默返回空，做一次 3s 退避重试。"""
+    args = _list_msgs_args(conv_id, 5)
     for attempt in range(2):
         out = run_dws(args, timeout=40)
-        try:
-            data = json.loads(out)
-            msgs = data.get("result", {}).get("messages", []) or []
-            if msgs:
-                msgs = sorted(msgs, key=_msg_ts, reverse=True)
-                return msgs[0]
-        except Exception:
-            pass
+        msgs = _parse_msgs(out)
+        if msgs:
+            return msgs[0]
         if attempt == 0:
             time.sleep(3)
     return {}
@@ -226,15 +233,10 @@ def get_latest_msg(conv_id):
 
 def _fetch_recent(conv_id, n=10):
     """拉该会话最近 n 条消息（已按时间倒序），用于活跃检测/调试。
-    复用 get_latest_msg 的 dws 调用方式，但返回多条（get_latest_msg 只取最新一条）。
     返回：list（成功，可能为空）或 None（dws 失败/异常，未确认）。
     关键：失败时返回 None 且不缓存——一次抖动不应毒化整个延迟窗口的检测；
     窗口内 dws 恢复正常的那次轮询仍能抓到老板活跃。"""
-    # 同上：时间上界推到「现在+10s」，避免边界秒级消息被 older 窗口排除（修复偶发取到上一条）。
-    _t = datetime.datetime.now() + datetime.timedelta(seconds=10)
-    tstr = _t.strftime("%Y-%m-%d %H:%M:%S")
-    args = ["chat", "message", "list", "--group", conv_id, "--time", tstr,
-            "--direction", "older", "--limit", str(n), "--format", "json"]
+    args = _list_msgs_args(conv_id, n)
     # 短时缓存（60s TTL）：仅缓存「成功」结果，省 dws 限流额度；
     # 失败结果（None）绝不缓存，留给下一轮重新尝试。
     cached = _RECENT_CACHE.get(conv_id)
@@ -249,16 +251,13 @@ def _fetch_recent(conv_id, n=10):
             if attempt == 0:
                 time.sleep(3)
             continue
-        try:
-            data = json.loads(out)
-            msgs = data.get("result", {}).get("messages", []) or []
-            result = sorted(msgs, key=_msg_ts, reverse=True)
+        msgs = _parse_msgs(out)
+        if msgs is not None:
+            result = msgs
             ok = True
             break
-        except Exception:
-            if attempt == 0:
-                time.sleep(3)
-            continue
+        if attempt == 0:
+            time.sleep(3)
     if not ok:
         # 两次均未成功（权限拒绝/限流/超时/非 JSON）→ 返回 None（不缓存）
         log_debug(f"[_fetch_recent] dws failed for {conv_id}, return None")
