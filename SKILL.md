@@ -60,6 +60,7 @@ dingtalk-auto-reply/
 | **codebuddy CLI** | SDK 底层起 prewarm server 用 | 随 WorkBuddy 安装；`CODEBUDDY_CMD` 路径见 `print_paths()` |
 | **node** | dws NODE-direct 路由需要 | 装 Node 并确保在可用路径 |
 | **gbrain MCP（可选）** | 查表 / 知识库；不配则纯人设回复 | `GBRAIN_MCP_URL` / `GBRAIN_MCP_TOKEN`，缺省自动读 `~/.workbuddy/mcp.json` 的 `gbrain` 条目 |
+| **代码库检索（可选）** | 让回复 agent 检索本地源码回答「源码/接口/实现细节」问题 | `.env` 填 `CODE_SEARCH_ROOTS`（分号分隔路径列表，不填=不启用）；`CODE_SEARCH_TOOL` 指向 search.py（默认自动探测 `~/.workbuddy/tools/code-search/search.py`，未装则回退 Grep/Glob/Read） |
 | **视觉识别（可选）** | 图片识别；与文本同后端、零额外 key | 默认跟随文本模型 `CODEBUDDY_MODEL`；可用 `VISION_MODEL` 单独指定 CodeBuddy 侧视觉模型。SDK 缺失时视觉与文本一并降级为「仅通知不识别」 |
 | **SDK 运行环境声明（`.env`）** | 让 skill / agent 识别「用哪个 python 跑」 | 安装时跑 `_setup_env.py` 自动把 `CODEBUDDY_SDK_PYTHON` / `CODEBUDDY_MODEL` / `CODEBUDDY_INTERNET_ENVIRONMENT` / `CODEBUDDY_CMD` 写入 `.env` |
 
@@ -184,6 +185,19 @@ agent 已注册时 `_resolve_persona()` 返回 None（不重复注入，避免�
 - `_MODE_LOCK` 与 `dingtalk-helper.md` 均写明「**gbrain 优先（事实性问题必须）、本地文件保底**」：事实性且需要的内容才调 `mcp__gbrain__search`/`query`；**若 gbrain 未接入 / 调用失败 / 超时 / 检索结果为空或明显不对题，回退**到工作空间本地 `产品资料/` `项目文件/` 文档用 Grep/Glob/Read 核实。两路都查不到才如实说「这个我得查下资料确认，稍回你」。本地文件是保底、并非禁用（之前"禁止读本地"的过激限制已撤销）。
 - 知识入库：**优先**把产品手册/项目文档/记忆整理进 gbrain（见 gbrain 自身文档）做主检索源；工作空间 `产品资料/` `项目文件/` 文档树**保留作保底回退**，仍随工作空间维护、不要删。
 
+### 🧩 本地代码库检索（CODE_SEARCH_ROOTS / CODE_SEARCH_TOOL，2026-08-04 新增，可选能力）
+
+**解决什么**：同事在钉钉问「源码 / 接口 / 实现细节」类问题（话题名、节点名、参数名、launch/配置文件、具体 .py/.cpp 实现逻辑），gbrain 文档往往没收录或过时 → agent **必须直接检索本地源码库**拿真实实现作答（同属"先查再答"必查项，禁止凭印象）。
+
+**通用设计（不绑定任何特定项目/型号）**：
+- 配置全走环境变量（`runtime.py` 常量 + `.env` 注入，源码零硬编码）：
+  - `CODE_SEARCH_ROOTS`：分号(;)分隔的本地源码库绝对路径列表；**不填 = 不启用代码检索**（agent 走 gbrain + 本地文档），通用 skill 默认留空，新用户填自己的源码目录即启用。
+  - `CODE_SEARCH_TOOL`：代码检索工具 search.py 路径（rg 全文 + ctags 符号定位的封装脚本），默认自动探测 `~/.workbuddy/tools/code-search/search.py`，装到别处可覆盖。
+- **工具优先、悬空防护**：`build_code_search_instruction()` 动态生成检索指令（拼进回复 agent 的 system_prompt）——search.py 存在 → 教 agent 用 Bash 调它（`search.py <关键词> --pkg <包名>` 全文 / `--symbol <符号名>` 定位定义，输出「路径:行号:内容」，命中后 Read 精读）；search.py 不存在 → 回退 Grep/Glob/Read 直接搜；两者都没有 → 整段不注入。与 gbrain 指令同读 `runtime` 实时值，绝不悬空。
+- 检索优先级：gbrain（文档/语义）→ 本地代码库（真实实现）→ 工作空间文档（保底）。
+
+**search.py 工具安装（可选增强，由部署者自行安装）**：装 ripgrep + Universal Ctags + 一个薄封装脚本 `search.py`（自带 `REPOS` 仓库映射 + `--index` 建 ctags 符号索引 + `--list-repos`），支持 `python search.py 关键词 [--pkg 包名] [--context N] [--max N] [--regex]` / `python search.py --symbol 符号名`。装好后 skill 自动探测并启用；不装也能跑（回退 Grep/Glob），只是大仓检索慢些。
+
 ## 运行时初始化：工作空间 / cwd 记忆 / dws 权限 / 项目说明（新用户须知）
 
 首次运行（或新机部署后首次启动监控）会自行重建 cwd 记忆上下文；**但工作空间目录需你手动 `mkdir`（默认 `~/WorkBuddy/dingtalk_auto_reply`，可配 `DINGTALK_WORKSPACE`），记忆不随包分发**：
@@ -260,6 +274,8 @@ cd ~/.workbuddy/skills/dingtalk-auto-reply && python gen_launcher.py
 1. **SERVER__PORT 端口冲突**（最致命）：每次生成分配空闲端口注入 `env["SERVER__PORT"]`，否则 `query()` 0 字节超时。
 2. **运行环境必须固定为托管 venv python**（`binaries/python/envs/default/Scripts/python.exe`）：本机 `codebuddy-agent-sdk` 装在 venv 里，用基础托管 python 跑会因 import 失败导致 `_SDK_AVAILABLE=False`。生产 launcher（`gen_launcher.py`）已固定 venv python，自测也要用 venv python。
 3. **别"回复自己"**：同前，`_is_self` + `SELF_OPEN_ID` 精确匹配。
+4. **⚠️ cmd.exe 8191 字符命令行限制（2026-08-04 实锤，最隐蔽）**：SDK 把 `AppendSystemPrompt` 的内容经 `--append-system-prompt` 拼进 **codebuddy.cmd（批处理）** 的命令行；Windows 执行 .cmd 必须经 cmd.exe，**整条命令行超 8191 字符即报「命令行太长」→ CLI 子进程秒退 → SDK 报 `CLIConnectionError: Connection closed`（0.1s）**。症状极像环境故障，但 CLI `-p` 直连一切正常。**修复=控制注入 system_prompt 的总长**：`_MODE_LOCK + few-shot + build_knowledge_instruction + build_code_search_instruction + 查表数据` 合计须 < ~7900 字符（含基础参数余量，安全值 7000）；2026-08-04 曾因 few-shot 扩容触发，精简后 5699 恢复。**改动任何注入段后必须跑 `python -c` 量总长**（见 reply.py 注释），超限即回退精简；排查「突然全部 Connection closed」先量长度、别怀疑环境。
+5. **⚠️ few-shot 只能放 append、不能搬进 agent 灵魂（2026-08-04 实测）**：曾把 few-shot 完整版写进 `dingtalk-helper.md` 灵魂（灵魂经 `--agent` 加载不走命令行、不受 8191 限制），结果 **agent 行为退化——连续 5 次测试不调 search.py/gbrain，凭记忆「回忆模式」直接答**；回滚灵魂 few-shot 段后立即恢复检索（3 次 tool_use + 精确源码细节回答）。**结论**：few-shot 放 append（system_prompt）是行为最强驱动力，灵魂里加重复内容会干扰（疑似模型对「上下文已有示例」产生惰性/缓存效应）。灵魂保持干净。**真源 = reply.py 的 `_FEW_SHOT_EXAMPLES` 常量**（2026-08-04 老板要求内联进代码 prompt，与 `_MODE_LOCK` 同级，不依赖 .md 读取）；`dws-reply-examples.md` 保留为随包分发文档副本（改动同步常量）。
 - **安全网统一**（防御纵深，别删）：`extract_reply()` 抽 `<reply>`、`_looks_like_reply()` 反拒废话/反问/角色扮演；质量不达标/超时/异常 → 空 → 不代发转人工。
 - **TEST_MODE=1**：生成的回复只发给老板自己（钉钉「自己」会话 `send_reply_self` + 微信 ClawBot `push_weixin`），**绝不发给原发送人**。自测用，验证效果不冒犯同事。详见 `_validate.py --inject`。
 
@@ -486,7 +502,7 @@ DEBUG_AGENT_TRACE=1 <venv_python> _validate.py --inject --sender 同事甲 --mes
 - **block 类型**：`[thinking]`=思考过程、`[tool_use]`=工具名+入参、`[tool_result]`=工具返回、`[result]`=最终 `<reply>`。
 - **典型排查**：回复说"还没对接"但轨迹里没有 `[tool_use] dws contact…` → agent 偷懒没查；有 `tool_use` 但没 `tool_result` → dws 命令失败（多半 PATH 问题，见 runtime.build_sdk_env 的 PATH 注入）；有 `tool_result` 但回复没引用 → 口吻/约束问题。
 - **默认关**（常驻防刷屏）：环境变量 `DEBUG_AGENT_TRACE=1` 开启，用完整绝对路径 venv python 跑才生效。
-- **配合 few-shot**：`dws-reply-examples.md`（skill 内，随包分发）每次调用注入 system_prompt，教 agent「提到人名+对接/进展→先调 dws 查记录再答，回复像老板真人、不暴露查询动作」。
+- **配合 few-shot**：`reply.py` 的 `_FEW_SHOT_EXAMPLES` 常量（内联进代码 prompt，2026-08-04 起；`dws-reply-examples.md` 为随包分发文档副本）每次调用注入 system_prompt，教 agent「提到人名+对接/进展→先调 dws 查记录再答；源码/接口问题→先调 search.py 查代码再答；回复像老板真人、不暴露查询动作」。
 
 ## 自测脚本 `_validate.py`
 
