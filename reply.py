@@ -61,7 +61,7 @@ SOUL_AGENT_FILE = os.path.join(_CODEBUDDY_AGENTS_DIR, f"{SOUL_AGENT}.md")
 PERSONA_BACKUP_FILE = os.path.join(_SKILL_DIR, "dingtalk-helper-backup.md")
 # ⚠️ 2026-08-03 老板要求：dws 查同事记录 few-shot 示例文件（每次调用注入 system_prompt，
 # 教 agent 遇到「对接/进展/记录」类问题时先调 dws 查真实记录再答，禁止偷懒凭印象）。
-# 文件用中性占位词（同事甲/小王），不含任何真实人名/隐私，可随包分发。
+# 文件用中性占位词（同事甲），不含任何真实人名/隐私，可随包分发。
 DWS_EXAMPLES_FILE = os.path.join(_SKILL_DIR, "dws-reply-examples.md")
 _AGENT_REGISTERED = os.path.isfile(SOUL_AGENT_FILE)
 if _AGENT_REGISTERED:
@@ -681,6 +681,29 @@ def gen_reply(sender, content, image_desc="", image_paths=None, return_rejected=
     return (out, "") if return_rejected else out
 
 
+# ---------- 质检（extract_reply / _looks_like_reply）共享常量 ----------
+# 均为只读正则/集合，模块级定义避免每次调用重建（_looks_like_reply 每回复调用多次）。
+# 「称呼：内容」开头的豁免白名单：正常口吻词，不以「转述别人」拦截
+_COLON_EXEMPT = {"注意", "说明", "补充", "提醒", "备注", "例如", "比如",
+                 "其实", "不过", "另外", "首先", "其次", "最后", "综上", "所以",
+                 "如果", "假如", "建议", "正经", "简单", "话说", "对了", "顺便"}
+_COLON_LEAD_RE = re.compile(r"^([一-龥]{2,4}|[A-Za-z0-9]{2,6})[:：]\s*(.*)$")
+# 助理/转述视角泄漏信号（2026-07-27 放宽反问、2026-08-03 删「示例」见下方注释）
+_ASSISTANT_LEAK_RE = re.compile(
+    r"(作为您的|我帮您|为您查询|需要我为您|我作为|"
+    r"要我帮你拟|要我(去|帮)拟|消息：|发件人：|同事发|对方：)")
+# 凭印象答事实性问题的含糊词 + 技术参数信号（2026-07-29 加，防跳过 gbrain 硬答）
+# ⚠️ 编译时带 re.I（等价原内联 re.search(..., re.I)），调用处不再传 flags
+_VAGUE_WORDS_RE = re.compile(r"(印象里|印象中|我记得|大概|大概是|应该是|好像是|似乎|差不多)")
+_TECH_PARAM_RE = re.compile(
+    r"(波特率|电压|电流|频率|功率|分辨率|精度|量程|接口|型号|参数|默认值|"
+    r"\d+\s*(bps|kbps|Mbps|V|mV|A|mA|Hz|kHz|MHz|GHz|W|kW|mm|cm|m|°|%|rpm|r/min))",
+    re.I)
+# extract_reply 兜底抽行时的「解释性前缀」词
+_META_PREFIX = ("我", "按", "建议", "在您", "在你", "是否", "要我", "如果", "注意",
+                "这条", "对方", "示例", "输出：", "现在", "请", "推荐", "综上", "所以")
+
+
 def extract_reply(text):
     """从 codebuddy 输出里稳当地取出「要发出的回复正文」。
     deepseek-v4-flash 偶发会进入"助手草稿模式"（给多个选项、反问是否要发），
@@ -706,9 +729,7 @@ def extract_reply(text):
         return quotes[-1].strip()
     # 4) 兜底：去掉明显的解释性前缀行，取最后一句像回复的短行
     lines = [l.strip() for l in t.splitlines() if l.strip()]
-    meta_prefix = ("我", "按", "建议", "在您", "在你", "是否", "要我", "如果", "注意",
-                   "这条", "对方", "示例", "输出：", "现在", "请", "推荐", "综上", "所以")
-    cand = [l for l in lines if not l.startswith(meta_prefix) and len(l) <= 80]
+    cand = [l for l in lines if not l.startswith(_META_PREFIX) and len(l) <= 80]
     if cand:
         return cand[-1]
     return t.strip()
@@ -734,10 +755,7 @@ def _looks_like_reply(text):
     # 角色扮演/转述标记：开头是「称呼：内容」式（如"小张：""某总："）——模型在转述对方，
     # 不是本人回复。但"注意：""说明：""不过："等是正常口吻，需豁免。
     # 仅匹配 2-4 字纯中文 / 2-6 字英文数字 的称呼+冒号，且不在豁免白名单内。
-    _COLON_EXEMPT = {"注意", "说明", "补充", "提醒", "备注", "例如", "比如",
-                     "其实", "不过", "另外", "首先", "其次", "最后", "综上", "所以",
-                     "如果", "假如", "建议", "正经", "简单", "话说", "对了", "顺便"}
-    m = re.match(r"^([一-龥]{2,4}|[A-Za-z0-9]{2,6})[:：]\s*(.*)$", text.strip())
+    m = _COLON_LEAD_RE.match(text.strip())
     if m and m.group(1).lower() not in _COLON_EXEMPT:
         return False
     # 澄清/反问类标记：仅拦「模型泄漏系统/转述视角」的明确信号
@@ -748,17 +766,14 @@ def _looks_like_reply(text):
     # ⚠️ 2026-08-03 修复：原正则含「示例」→ agent 查 dws 记录后回复「…示例展示的修改…」
     # （正常业务词，宣传页/文档语境）被误判"示范输出"拦下（实测复现）。「示例」太宽泛，
     # 删掉；模型若真输出"示例回复：…"仍会被 extract_reply 的 meta_prefix / <reply> 标签兜底。
-    if re.search(r"(作为您的|我帮您|为您查询|需要我为您|我作为|"
-                 r"要我帮你拟|要我(去|帮)拟|消息：|发件人：|同事发|对方：)", text):
+    if re.search(_ASSISTANT_LEAK_RE, text):
         return False
     # ⚠️ 凭印象答事实性问题拦截（2026-07-29 加）：当 agent 跳过 gbrain 直接凭记忆答规格/参数时，
     # 常出现"印象里 / 我记得 / 大概 / 应该是 / 出厂默认 / 印象中"等含糊词。
     # 这种回复违反【严禁编造】+【必须先查 gbrain】，转人工让老板看到草稿更安全。
     # 触发条件：含糊词 + 出现技术参数信号（数字+单位/型号/波特率/电压/电流/频率等）。
-    _VAGUE = re.search(r"(印象里|印象中|我记得|大概|大概是|应该是|好像是|似乎|差不多)", text)
-    if _VAGUE and re.search(r"(波特率|电压|电流|频率|功率|分辨率|精度|量程|接口|型号|参数|默认值|"
-                            r"\d+\s*(bps|kbps|Mbps|V|mV|A|mA|Hz|kHz|MHz|GHz|W|kW|mm|cm|m|°|%|rpm|r/min))",
-                            text, re.I):
+    _VAGUE = re.search(_VAGUE_WORDS_RE, text)
+    if _VAGUE and re.search(_TECH_PARAM_RE, text):
         return False
     # 反问句：老板回同事时反问/确认细节是正常风格，一律放行
     # （>800字跑题已由上方长度闸拦截，无需在此重复限制）。
@@ -781,7 +796,6 @@ def push_weixin(text, retries=2, retry_wait=3):
     # （ret=-2 / prepare failed / 会话已失效）立即失败，不空转重试——
     # 交给上层 GNOTIFY 慢重试或老板激活 ClawBot 后补发。
     NEED_ACTIVATE_HINTS = ("ret=-2", "prepare failed", "会话已失效", "bot id")
-    import time as _time
     for attempt in range(retries):
         try:
             r = subprocess.run([NODE, SEND_JS, text], timeout=30,
@@ -789,7 +803,7 @@ def push_weixin(text, retries=2, retry_wait=3):
         except Exception as e:
             log_debug(f"weixin push error attempt={attempt+1}/{retries}: {e}")
             if attempt < retries - 1:
-                _time.sleep(retry_wait)
+                time.sleep(retry_wait)
                 continue
             return False
         out = (r.stdout or b"").decode("utf-8", "replace")
@@ -804,7 +818,7 @@ def push_weixin(text, retries=2, retry_wait=3):
             log_audit("weixin_push_fail", text=text[:200], rc=r.returncode, err=snippet[:200])
             return False
         if attempt < retries - 1:
-            _time.sleep(retry_wait)
+            time.sleep(retry_wait)
             continue
         log_audit("weixin_push_fail", text=text[:200], rc=r.returncode, err=snippet[:200])
         return False
