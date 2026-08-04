@@ -24,28 +24,35 @@ CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 # ---------- 轻量 .env 加载器（零依赖，保证可移植） ----------
+def parse_env_text(text):
+    """把 .env 文本解析为 {KEY: VALUE} 字典（纯函数，供 _load_env_file /
+    _setup_env.py 复用，消除两处重复解析逻辑）。
+    支持的写法：KEY=VALUE、KEY="带空格的值"、# 注释、空行。"""
+    out = {}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if not k:
+            continue
+        # 去首尾引号
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            v = v[1:-1]
+        out[k] = v
+    return out
+
+
 def _load_env_file(path):
-    """手写解析 .env（不引入 python-dotenv 依赖）。
-    支持的写法：KEY=VALUE、KEY="带空格的值"、# 注释、空行。
-    已存在的环境变量不被覆盖（.env 只补缺）。返回加载的 key 数。"""
+    """加载 .env 到 os.environ（已存在的环境变量不被覆盖，.env 只补缺）。
+    返回加载的 key 数。"""
     if not path or not os.path.exists(path):
         return 0
     n = 0
     try:
         with open(path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                k, v = k.strip(), v.strip()
-                if not k:
-                    continue
-                # 去首尾引号
-                if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
-                    v = v[1:-1]
+            for k, v in parse_env_text(f.read()).items():
                 if k not in os.environ:   # 不覆盖已存在的环境变量
                     os.environ[k] = v
                     n += 1
@@ -156,12 +163,10 @@ def _resolve_bin(explicit_env, subpath_no_ext, versioned_glob_no_ext=None):
     return ""
 
 
-def _detect_china_edition():
-    """检测是否为中国版（api.copilot.tencent.com）。
-    CodeBuddy CLI 把网络环境标记存在 ~/.codebuddy/local_storage/ 下某个 entry 文件，
-    内容恰好是字符串 "internal"（已在本机确认：某个 entry_*.info = "internal"）。
-    命中即中国版，生成时须注入 CODEBUDDY_INTERNET_ENVIRONMENT=internal，否则连不上。
-    返回 True/False。"""
+def _scan_local_storage(matcher):
+    """遍历 ~/.codebuddy/local_storage 下 entry_*.info 文件，用 matcher(文本) 判定。
+    返回 True=任一文件命中；False=目录缺失/无 entry 文件/全部未命中。
+    _detect_china_edition 与 _cli_credentials_present 共用此遍历逻辑（消除重复）。"""
     try:
         ls_dir = os.path.join(os.path.expanduser("~"), ".codebuddy", "local_storage")
         if not os.path.isdir(ls_dir):
@@ -171,13 +176,22 @@ def _detect_china_edition():
                 continue
             try:
                 with open(os.path.join(ls_dir, fn), encoding="utf-8", errors="ignore") as f:
-                    if '"internal"' in f.read():
+                    if matcher(f.read()):
                         return True
             except Exception:
                 continue
     except Exception:
         pass
     return False
+
+
+def _detect_china_edition():
+    """检测是否为中国版（api.copilot.tencent.com）。
+    CodeBuddy CLI 把网络环境标记存在 ~/.codebuddy/local_storage/ 下某个 entry 文件，
+    内容恰好是字符串 "internal"（已在本机确认：某个 entry_*.info = "internal"）。
+    命中即中国版，生成时须注入 CODEBUDDY_INTERNET_ENVIRONMENT=internal，否则连不上。
+    返回 True/False。"""
+    return _scan_local_storage(lambda txt: '"internal"' in txt)
 
 
 DWS_CMD = _resolve_bin("DWS_CMD",
@@ -356,6 +370,15 @@ def _pid_alive(pid):
         return False
 
 
+def _clean_legacy_lock_file():
+    """兼容清理：旧 PID 文件锁若残留则删除（已被端口锁取代，仅清理历史残留）。"""
+    try:
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+    except OSError:
+        pass
+
+
 def _acquire_lock():
     """单实例锁：用固定本地端口绑定（最稳，彻底绕开 Windows 进程树/PID/OpenProcess 全部坑）。
     第一个实例 bind 127.0.0.1:LOCK_PORT 成功并持有该 socket（直到进程退出）；
@@ -372,12 +395,7 @@ def _acquire_lock():
         s.bind(("127.0.0.1", LOCK_PORT))
         s.listen(1)
         _LOCK_SOCK = s
-        # 兼容清理：旧 PID 文件锁若残留则删除
-        try:
-            if os.path.exists(LOCK_FILE):
-                os.remove(LOCK_FILE)
-        except OSError:
-            pass
+        _clean_legacy_lock_file()
         return True
     except OSError:
         return False
@@ -395,12 +413,7 @@ def _release_lock():
             _LOCK_SOCK = None
     except Exception:
         pass
-    # 兼容清理：旧 PID 文件锁若残留则删除
-    try:
-        if os.path.exists(LOCK_FILE):
-            os.remove(LOCK_FILE)
-    except OSError:
-        pass
+    _clean_legacy_lock_file()
 
 
 def _clean_media_cache(max_age_days=7):
@@ -584,23 +597,8 @@ def _cli_credentials_present():
     token/bearer/secret 凭据词的 entry 文件（已在本机确认存在多个 entry_*.info 含此类词）。
     这是 Electron IndexedDB 私有格式，不强依赖精确字段名——只做『凭据文件存在』的粗判，
     真正的硬保证是运行时 SDK query 本身（未登录会抛鉴权错误，被 gen_reply 捕获转不代发）。"""
-    try:
-        ls_dir = os.path.join(os.path.expanduser("~"), ".codebuddy", "local_storage")
-        if not os.path.isdir(ls_dir):
-            return False
-        for fn in os.listdir(ls_dir):
-            if not fn.startswith("entry_") or not fn.endswith(".info"):
-                continue
-            try:
-                with open(os.path.join(ls_dir, fn), encoding="utf-8", errors="ignore") as f:
-                    blob = f.read().lower()
-                if any(k in blob for k in ("token", "bearer", "secret", "credential", "auth")):
-                    return True
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return False
+    _keys = ("token", "bearer", "secret", "credential", "auth")
+    return _scan_local_storage(lambda txt: any(k in txt.lower() for k in _keys))
 
 
 def check_codebuddy_auth():
