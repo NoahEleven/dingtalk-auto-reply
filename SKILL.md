@@ -276,6 +276,7 @@ cd ~/.workbuddy/skills/dingtalk-auto-reply && python gen_launcher.py
 3. **别"回复自己"**：同前，`_is_self` + `SELF_OPEN_ID` 精确匹配。
 4. **⚠️ cmd.exe 8191 字符命令行限制（2026-08-04 实锤，最隐蔽）**：SDK 把 `AppendSystemPrompt` 的内容经 `--append-system-prompt` 拼进 **codebuddy.cmd（批处理）** 的命令行；Windows 执行 .cmd 必须经 cmd.exe，**整条命令行超 8191 字符即报「命令行太长」→ CLI 子进程秒退 → SDK 报 `CLIConnectionError: Connection closed`（0.1s）**。症状极像环境故障，但 CLI `-p` 直连一切正常。**修复=控制注入 system_prompt 的总长**：`_MODE_LOCK + few-shot + build_knowledge_instruction + build_code_search_instruction + 查表数据` 合计须 < ~7900 字符（含基础参数余量，安全值 7000）；2026-08-04 曾因 few-shot 扩容触发，精简后 5699 恢复。**改动任何注入段后必须跑 `python -c` 量总长**（见 reply.py 注释），超限即回退精简；排查「突然全部 Connection closed」先量长度、别怀疑环境。
 5. **⚠️ few-shot 只能放 append、不能搬进 agent 灵魂（2026-08-04 实测）**：曾把 few-shot 完整版写进 `dingtalk-helper.md` 灵魂（灵魂经 `--agent` 加载不走命令行、不受 8191 限制），结果 **agent 行为退化——连续 5 次测试不调 search.py/gbrain，凭记忆「回忆模式」直接答**；回滚灵魂 few-shot 段后立即恢复检索（3 次 tool_use + 精确源码细节回答）。**结论**：few-shot 放 append（system_prompt）是行为最强驱动力，灵魂里加重复内容会干扰（疑似模型对「上下文已有示例」产生惰性/缓存效应）。灵魂保持干净。**真源 = reply.py 的 `_FEW_SHOT_EXAMPLES` 常量**（2026-08-04 老板要求内联进代码 prompt，与 `_MODE_LOCK` 同级，不依赖 .md 读取）；`dws-reply-examples.md` 保留为随包分发文档副本（改动同步常量）。
+6. **⚠️ 毫秒/秒时间戳混用（2026-08-05 实锤，隐蔽排序 bug）**：dws 的 `lastMsgCreateAt` 是**毫秒**（13 位，如 1584669332376），消息对象 `createTime` 常是**秒级字符串**——两者混用排序差 1000 倍。**症状**：图片消息（PENDING 初始 msgs[0].ts 用 lastMsgCreateAt 毫秒）被误判为"最新"，burst 窗口以它为锚，图片**之后**连发的文字消息（秒级）全落窗外 → 进背景历史 → AI 只回图片不回文字（老板 08-05 反馈）；还导致 `NOTIFIED` 去重失效（job.ts 秒 vs lastMsgCreateAt 毫秒永不相等 → 重复处理/重复推送隐患）。**修复**：`dingtalk_api._norm_ts(v)`（数字 >1e11 判定毫秒 ÷1000 归一化为秒），`_msg_ts` 数字分支与 monitor 的 `last_ts` 统一走它——全链路（PENDING.msgs[].ts / job.ts / NOTIFIED / burst 排序）秒级一致。**凡新增时间字段解析，一律经 `_norm_ts` 归一化**。
 - **安全网统一**（防御纵深，别删）：`extract_reply()` 抽 `<reply>`、`_looks_like_reply()` 反拒废话/反问/角色扮演；质量不达标/超时/异常 → 空 → 不代发转人工。
 - **TEST_MODE=1**：生成的回复只发给老板自己（钉钉「自己」会话 `send_reply_self` + 微信 ClawBot `push_weixin`），**绝不发给原发送人**。自测用，验证效果不冒犯同事。详见 `_validate.py --inject`。
 
@@ -309,9 +310,9 @@ cd ~/.workbuddy/skills/dingtalk-auto-reply && python gen_launcher.py
 - **钉钉"特别关注"联系人列表 dws 拿不到**，无法按"是否特别关注"精确过滤；因此用"是否 @我/@all"这个可识别维度来收敛群推送。
 
 **方案（内容启发式，零额外 API 调用 + `GROUP_PUSH` 策略开关）**：
-- `group_msg_is_at_me(content)` 判据：
-  1. 内容含 `@所有人` / `@all` / `<@all>`（dws 发送占位）→ 必然含老板 → `True`；
-  2. 内容以 `@昵称` 开头且昵称命中 `MENTION_NAMES` → `True`；
+- `group_msg_is_at_me(content)` 判据（⚠️ 2026-08-05 修复：由「仅开头单@」放宽为任意位置子串匹配）：
+  1. 内容含 `@所有人` / `@all`（词边界）/ `<@all>`（dws 发送占位）→ 必然含老板 → `True`；
+  2. 内容【任意位置】含 `@昵称`（命中 `MENTION_NAMES`）→ `True`——兼容句首/句中/句末、多个 @ 连排、`@@昵称` 双 @ 格式；
   3. 其它（普通群消息、@别人、特别关注发言、媒体无文本）→ `False`。
 - **群聊微信推送按 `GROUP_PUSH` 策略**（仅作用于群消息；单聊代复+提醒不受影响）：
   - `atme`（**默认**）：仅 `at_me=True`（@我/@all）才推微信；其余群消息**静默跳过，不推**。
@@ -324,6 +325,17 @@ cd ~/.workbuddy/skills/dingtalk-auto-reply && python gen_launcher.py
 - 群推送策略：`GROUP_PUSH=atme`（默认）｜ `all` ｜ `off`。
 
 **局限**：纯展示名匹配，若群里恰好有人昵称与你相同会误判（极罕见）；如需 100% 服务端权威，可改用 `list-mentions` 二次确认（见上"接口事实"），当前为成本/可靠性权衡选择启发式。
+
+### 🧪 群聊 AI 草稿预览（GROUP_REPLY_PREVIEW，2026-08-05 新增，可选能力，默认关）
+
+**解决什么**：老板想验证「群聊 @我 也能 AI 生成回复」的效果，但**红线是不在群聊替老板发言**——所以做成**草稿预览**：生成后绝不发钉钉群，只推微信给老板看，验证期后再决定是否开放真代发。
+
+**机制**（复用单聊 PENDING 状态机，零新状态）：
+- 触发：`GROUP_REPLY_PREVIEW=1` 且 群聊 @我（at_me）且**有文本**（纯图片 @我 保持现有通知，不预览）。
+- 流程：进延迟窗口（`REPLY_DELAY_SEC` 2min，与单聊一致）→ 窗口内活跃检测（老板在群里则取消）→ 窗口内消息累积为背景历史（`_fetch_recent`，含老板历史发言标记 is_self）→ 到期 `gen_reply` 生成（session `dt_<cid>` 记忆连续，支持查表/知识库/代码检索全链路）→ **只 `push_weixin` 推草稿**（标签「🔔 钉钉群聊·AI 草稿（未发送）」，附群名/@我的人/原文/草稿），**绝不调用 `send_reply`**。
+- job 标记 `preview_only=True`；分发处 `if job.get("preview_only")` 走预览分支（微信推送失败复用 `_pending_after_send` 重试语义）。
+- 生成失败 → 推微信「群聊 @你 · AI 草稿生成失败」转人工。
+- 配置：`.env` 填 `GROUP_REPLY_PREVIEW=1`（默认 0=关，通用安全）。验证期后若要真代发，再评估放开（需额外确认群聊口吻/权限）。
 
 ## 图片识别（群聊 @我 / 单聊图片补全内容）
 
