@@ -469,6 +469,7 @@ async def _gen_reply_sdk_async(persona, prompt, image_paths=None,
         else:
             yield {"type": "user", "message": {"role": "user", "content": prompt}}
     chunks = []
+    result_fallback = ""  # ⚠️ 2026-08-06 修复：ResultMessage.result 兜底（见下）
     # ⚠️ 2026-08-03 老板要求：agent 是流式输出，可观察完整思考/执行过程。
     # 解析时除 TextBlock（最终回复）外，把 ThinkingBlock（思考）/ ToolUseBlock（工具名+入参）/
     # ToolResultBlock（工具结果）也打进调试日志——排查「agent 到底调没调 dws / 查到了什么」时
@@ -487,11 +488,22 @@ async def _gen_reply_sdk_async(persona, prompt, image_paths=None,
                         _trace_buf.append(f"[tool_use] {block.name} input={json.dumps(block.input, ensure_ascii=False)[:400]}")
                     elif isinstance(block, ToolResultBlock):
                         _trace_buf.append(f"[tool_result] {str(block.content or '')[:400]} is_error={block.is_error}")
-        elif _trace and isinstance(message, ResultMessage):
-            _trace_buf.append(f"[result] {str(getattr(message, 'result', ''))[:300]}")
+        elif isinstance(message, ResultMessage):
+            # ⚠️ 2026-08-06 修复（空返回根因）：模型偶发把「最终回复」放在 ResultMessage.result，
+            # 而不走 AssistantMessage 的 TextBlock 流——原代码只收集 TextBlock，导致这种调用被
+            # 误判为「SDK 空返回」（实际回复已在 result 里），重试同样中招，最终转人工不代发。
+            # 现在把 result 收集为兜底，TextBlock 为空时用它（extract_reply 会抽 <reply>/正文）。
+            _r = str(getattr(message, "result", "") or "").strip()
+            if _r and not result_fallback:
+                result_fallback = _r
+            if _trace:
+                _trace_buf.append(f"[result] {_r[:300]}")
     if _trace and _trace_buf:
         log_debug("[agent-trace]\n" + "\n".join(_trace_buf))
-    return "".join(chunks).strip()
+    raw = "".join(chunks).strip()
+    if not raw and result_fallback:
+        raw = result_fallback
+    return raw
 
 
 def _build_user_msg(main_line, history_lines, burst_mode):
@@ -764,10 +776,35 @@ def gen_reply(sender, content, image_desc="", image_paths=None, return_rejected=
                 _resp_txt = _resp.text if hasattr(_resp, "text") else str(_resp)
             except Exception:
                 _resp_txt = ""
-        log_debug(f"[gen_reply] SDK 调用失败 -> 不代发: {type(e).__name__}: {e}")
-        if _resp_txt:
-            log_debug(f"[gen_reply] SDK 响应体(前500): {_resp_txt[:500]}")
-        return ("", f"[SDK调用失败] {type(e).__name__}: {e}") if return_rejected else ""
+        _err_txt = f"{type(e).__name__}: {e}"
+        # ⚠️ 2026-08-07 修复：400 mime/参数类错误常见于「resume 续上下文时把历史媒体（图片/语音）带进请求」——
+        # 即使本次消息是纯文字，只要该会话历史里含媒体，SDK resume 也会 400
+        # （2026-07-24 已知坑 #4「媒体消息代复 400」的延伸形态，当时待排查方向=失败重试不带 session）。
+        # 此时降级为不带 session 全新生成一次：放弃会话记忆换取正常代复，成功即用，仍失败才转人工。
+        if (session_id or resume) and ("400" in _err_txt or "mime" in _err_txt.lower()
+                                       or "invalid parameter" in _err_txt.lower()):
+            log_debug(f"[gen_reply] SDK 400（疑似历史媒体+resume）-> 降级为不带 session 重试 1 次: {_err_txt[:150]}")
+            try:
+                raw = asyncio.run(asyncio.wait_for(
+                    _gen_reply_sdk_async(sys_text, user_msg, image_paths=image_paths,
+                                         session_id=None, resume=False),
+                    timeout=_call_timeout))
+            except Exception as e2:
+                log_debug(f"[gen_reply] 降级重试也失败: {type(e2).__name__}: {e2}")
+                raw = None
+            if raw:
+                log_debug(f"[gen_reply] 降级重试成功（无 session），len={len(raw)}")
+                # 成功则跳过下方 return，走统一质检流程
+            else:
+                log_debug(f"[gen_reply] SDK 调用失败 -> 不代发: {_err_txt}")
+                if _resp_txt:
+                    log_debug(f"[gen_reply] SDK 响应体(前500): {_resp_txt[:500]}")
+                return ("", f"[SDK调用失败] {_err_txt}") if return_rejected else ""
+        else:
+            log_debug(f"[gen_reply] SDK 调用失败 -> 不代发: {_err_txt}")
+            if _resp_txt:
+                log_debug(f"[gen_reply] SDK 响应体(前500): {_resp_txt[:500]}")
+            return ("", f"[SDK调用失败] {_err_txt}") if return_rejected else ""
     _agent_warmed = True  # 成功完成一次 SDK 生成，后续调用用常规超时
     if not raw:
         return ("", "") if return_rejected else ""
