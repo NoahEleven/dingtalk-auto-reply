@@ -49,11 +49,12 @@ from runtime import (
     POLL_INTERVAL, check_codebuddy_auth, print_auth_banner, log_debug, _acquire_lock,
     _release_lock, _SKILL_DIR, NOTIFIED, PENDING, LAST_SELF_SENT, AUDIT_LOG, AUDIT_LOG_MAX,
     GROUP_PUSH, SKIP_SENDERS, FALLBACK_REPLY, _RECENT_CACHE, save_state,
+    GROUP_REPLY_PREVIEW,
     log_audit, _clean_media_cache, DWS_CMD, CODEBUDDY_CMD, NODE, SEND_JS, GNOTIFY,
     DWS_ENTRY, DWS_EXE, CHINA_EDITION, CODEBUDDY_API_KEY,
 )
 from dingtalk_api import (
-    run_dws, msg_field, extract_sender_open_id, msg_sender_open_id, _msg_ts,
+    run_dws, msg_field, extract_sender_open_id, msg_sender_open_id, _msg_ts, _norm_ts,
     get_unread, get_latest_msg, _fetch_recent,
     find_single_conversation, owner_recently_active, _as_text, _is_self, group_msg_is_at_me,
     extract_media_ids, clean_text_for_ai, download_images, send_reply, get_self_openid,
@@ -369,7 +370,20 @@ def main():
                                             messages=job.get("msgs"))
                 SESSION_RESUMED[sid] = True
                 if reply:
-                    if TEST_MODE:
+                    if job.get("preview_only"):
+                        # 🆕 群聊 AI 草稿预览（2026-08-05）：生成后【绝不发钉钉群】（红线：不在群聊替老板发言），
+                        # 只推微信给老板预览验证；老板确认后如需代发另行处理。
+                        _title_disp = f"群：{job.get('title','')}\n"
+                        notify_ok = push_weixin(
+                            f"🔔 钉钉群聊·AI 草稿（未发送）\n{_title_disp}@我的人：{job['sender']}\n"
+                            f"内容：{str(job['content'])[:200]}\n\n"
+                            f"🤖 草稿：{reply[:300]}\n\n（验证期只预览不发送，确认后告诉我，我再帮你发到群里）")
+                        log_audit("group_preview", cid=cid, title=job.get("title",""), sender=job["sender"],
+                                  content=str(job["content"])[:200], reply=reply[:200], sent_to_weixin=notify_ok, delayed=True)
+                        log_debug(f"[group-preview] 草稿已推微信(未发钉钉) sender={job['sender']} -> {reply[:60]}")
+                        # 复用 _pending_after_send 的微信推送重试/放弃语义（ok_send 传 True：未发钉钉是设计而非失败）
+                        act2, job = _pending_after_send(job, True, notify_ok, now)
+                    elif TEST_MODE:
                         # 测试模式：生成的回复只发给老板自己（钉钉自己会话 + 微信），绝不发给原发送人
                         send_reply_self(reply)
                         push_weixin(f"🧪【TEST·本应代复给 {job['sender']}】\n{reply}")
@@ -416,7 +430,11 @@ def main():
                     log_audit("skip_reply", cid=cid, sender=job["sender"], content=str(job["content"])[:200], reason=reason, delayed=True)
                     log_debug(f"[single-delayed-skip] sender={job['sender']} reason={reason} rejected_len={len(rejected) if rejected else 0} rejected_preview={(rejected[:800] if rejected else '')!r}")
                     draft_line = f"\n\n🤖 生成的内容（未代发到钉钉）：{rejected[:500]}" if rejected else ""
-                    if TEST_MODE:
+                    if job.get("preview_only"):
+                        # 群聊预览生成失败 → 转人工（老板自己在群里回）
+                        _title_disp = f"群：{job.get('title','')}\n"
+                        push_weixin(f"🔔 钉钉群聊 @你（AI 草稿生成失败）\n{_title_disp}@我的人：{job['sender']}\n内容：{str(job['content'])[:200]}\n\n⚠️ {reason}，请老板在群里手动回复{draft_line}")
+                    elif TEST_MODE:
                         push_weixin(f"🧪【TEST·需手动处理·原发送人 {job['sender']}】\n内容：{str(job['content'])[:200]}\n\n⚠️ {reason}，未代复{draft_line}")
                     else:
                         push_weixin(f"🔔 钉钉新消息（单聊·需手动处理）\n来自：{job['sender']}\n内容：{str(job['content'])[:200]}\n\n⚠️ {reason}，未代复，请老板手动回复{draft_line}")
@@ -478,7 +496,9 @@ def main():
                 unread = conv.get("unreadPoint") or 0
                 is_single = conv.get("singleChat", False)
                 # 去重键用未读对象里始终存在的 lastMsgCreateAt（msg_id 可能为空的媒体消息，不能作为去重依据）
-                last_ts = conv.get("lastMsgCreateAt") or 0
+                # ⚠️ 2026-08-05 修复：必须 _norm_ts 归一化为秒——lastMsgCreateAt 是毫秒（13 位），
+                # 不归一化会与 _msg_ts 解析的秒级 ts 混排差 1000 倍（图片消息误判最新、连发文字掉进背景历史、去重失效）。
+                last_ts = _norm_ts(conv.get("lastMsgCreateAt") or 0)
 
                 # 启动静默 seed：记录当前未读时间戳，避免启动时回 backlog（不代复）。
                 # 但对「近期(24h 内)到达」的单聊未读，发一次被动通知让老板知情——
@@ -509,6 +529,9 @@ def main():
                 has_text = bool(clean)
                 body = (clean[:600] if clean else "(图片/媒体消息)").strip() or "(图片/媒体消息)"
 
+                # 群聊 @我/@all 判定（提前算：群聊 AI 草稿预览分支需要；单聊恒 False）
+                at_me = (not is_single) and group_msg_is_at_me(content or body)
+
                 # 老板本人发的最后一条 → 不代复（他在自己聊，或已回复），跳过免得"回复自己"
                 if is_single and _is_self(sender, sender_open_id):
                     NOTIFIED[cid] = last_ts
@@ -516,7 +539,10 @@ def main():
                     log_debug(f"[self] latest msg from self ({sender}), skip auto-reply")
                     continue
 
-                if is_single and not any(k in (sender or "") for k in SKIP_SENDERS) and msg_id:
+                # 🆕 2026-08-05 群聊 AI 草稿预览：@我 且有文本 → 复用单聊 PENDING 机制
+                # （2min 延迟 + 背景历史 + AI 生成），生成后只推微信预览、绝不发钉钉群。
+                _grp_preview = (not is_single) and GROUP_REPLY_PREVIEW and at_me and has_text
+                if (is_single or _grp_preview) and not any(k in (sender or "") for k in SKIP_SENDERS) and msg_id:
                     if cid in PENDING:
                         # 已在延迟窗口等待：把窗口内新到的消息累积进 job，
                         # 等待期结束时统一作为「一条连贯回复」回应（而非逐条零散代复）。
@@ -610,8 +636,14 @@ def main():
                             "msgs": [{"sender": sender, "content": (clean if clean else "(图片消息)"),
                                       "msg_id": msg_id, "ts": last_ts}],
                             "defers": 0,
+                            # 🆕 群聊 AI 草稿预览标记（2026-08-05）：True=群聊@我 预览（只推微信不发钉钉）；
+                            # 单聊代发为 False/缺省。分发处据此决定 send_reply vs push_weixin。
+                            "preview_only": bool(_grp_preview),
+                            "title": title if _grp_preview else "",
+                            "at_me": bool(at_me) if _grp_preview else False,
                         }
-                        log_debug(f"[pending] cid={cid} sender={sender} delay={REPLY_DELAY_SEC}s auto_img={want_auto_image}")
+                        _tag = "group-preview" if _grp_preview else "single"
+                        log_debug(f"[pending] cid={cid} sender={sender} delay={REPLY_DELAY_SEC}s auto_img={want_auto_image} mode={_tag}")
                 else:
                     # 群聊 / skip 名单 / 缺 msg_id：仅通知，不代发
                     at_me = (not is_single) and group_msg_is_at_me(content or body)
