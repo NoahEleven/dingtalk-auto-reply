@@ -479,6 +479,12 @@ _RECENT_CACHE = {}   # cid -> (expiry_ts, msgs)：活跃检测用的「最近消
 #   off  = 群聊完全不推微信
 GROUP_PUSH = os.environ.get("GROUP_PUSH", "atme").lower()
 
+# 群聊 AI 草稿预览（可选能力，2026-08-05 新增，默认关）：
+# 开启后，群聊 @我 且【有文本】的消息复用单聊机制（2min 延迟窗口 + 背景历史 + AI 生成回复），
+# 但生成结果【绝不直接发到钉钉群】——只推微信给老板预览验证（红线：不在群聊替老板发言）。
+# 老板确认草稿后如需代发，另行人工/指令处理。验证期用；GROUP_REPLY_PREVIEW=1 开启。
+GROUP_REPLY_PREVIEW = os.environ.get("GROUP_REPLY_PREVIEW", "0") == "1"
+
 def _split_set(env_name, default):
     """从环境变量（逗号分隔）读取集合；未设置则用默认值。
     用于 SKIP_SENDERS / SELF_SENDERS 的可配置化（不必硬编码改源码）。"""
@@ -529,21 +535,33 @@ AUTO_REPLY_IMAGE = os.environ.get("AUTO_REPLY_IMAGE") != "0"
 
 
 # ---------- 群聊 @我 检测（共享正则） ----------
-# dws 单条消息对象无结构化 atUsers 字段，@ 只体现在内容前缀纯文本 '@昵称'。
-# 判据：内容以 '@昵称' 开头且昵称命中 MENTION_NAMES；或内容含 @所有人/@all（必然含老板）。
+# dws 单条消息对象无结构化 atUsers 字段，@ 只体现在内容纯文本 '@昵称'。
+# 判据见 dingtalk_api.group_msg_is_at_me（2026-08-05 改为任意位置子串匹配，兼容 @@ 双@/句中@）。
 # 这是基于展示名的启发式（零额外 API 调用、廉价可靠）；若老板群昵称特殊，用 MENTION_NAMES 覆盖。
 # 隐私：源码不硬编码真实昵称，请在私密 .env 里配 MENTION_NAMES="你的群昵称"（逗号分隔）。
 MENTION_NAMES = set(x.strip() for x in os.environ.get("MENTION_NAMES", "老板").split(",") if x.strip())
-_AT_RE = re.compile(r"^@([^\s@：:，,。.!！?？；;]+)")  # 群消息 @ 前缀：@昵称（不含空白/标点）
 
-# 钉钉富媒体（图片）辅助正则：
-# 钉钉把图片内联进 content 文本：'[图片消息](mediaId=@lQLPJwBX...)'，
-# 纯文本/图片混合消息都能命中；可能一条消息含多张图。
+# 钉钉富媒体（图片/语音/视频/文件）辅助正则：
+# 钉钉把媒体内联进 content 文本：'[图片消息](mediaId=@lQLPJwBX...)' / '[语音消息](mediaId=@lR_P...)'，
+# 纯文本/媒体混合消息都能命中；可能一条消息含多张图。
 # 注意：mediaId 前缀不固定——有的以 '@' 开头，有的以 '$' 开头（如 '$iwEcAq...'），
 # 还可能含 '-'。旧正则 [@\w\-_]+ 不认 '$' 会漏掉整条 → 图片提取为空 → 降级仅通知。
 # 改为匹配到右括号/空白前的所有非空白字符，兼容任意前缀。
 _MEDIA_RE = re.compile(r'mediaId=([^)\s]+)')
-_PIC_TAG_RE = re.compile(r'\[[^\]]*图片[^\]]*\]\(mediaId=[^)\s]+\)')
+# ⚠️ 2026-08-07 新增：视频/语音/文件标签整段剔除（extract_media_ids 用它先剥掉非图片标签，
+# 防止视频 mediaId 被当图片下载内联 → SDK 400 mime）。注意不含"图片"，图片标签保留给 _MEDIA_RE 提取。
+_NON_IMAGE_TAG_RE = re.compile(r'\[[^\]]*(?:视频|语音|文件|音频)[^\]]*\]\(mediaId=[^)\s]+\)?')
+# ⚠️ 2026-08-07 修复（400 mime 根因，老板纠偏）：旧正则只匹配「图片」标签且要求右括号闭合——
+# ①'$' 开头的 mediaId 消息 dws 返回常【不闭合括号】→ 整段残留进背景历史；
+# ②'[语音消息]/[视频消息]/[文件消息]' 等标签完全不匹配 → 残留。
+# 残留的 mediaId=... 文本混进 user_msg 背景历史 → SDK 把 mediaId 当媒体 mime 解析 → 400。
+# 修复：匹配【任意媒体标签】+ 右括号【可选】；纯媒体无文字说明则清空整段。
+_PIC_TAG_RE = re.compile(r'\[[^\]]*\]\(mediaId=[^)\s]+\)?')
+# ⚠️ 2026-08-07 补充（视频空括号标记）：dws 对视频/语音消息除 mediaId 格式外，还有
+# 【空括号占位】格式 '[视频]()'（温兆龙 08-07 案例：'…辛苦看下[图片消息](mediaId=@lQD…)[视频]()'
+# ——图片 mediaId 被 _PIC_TAG_RE 清掉后，'[视频]()' 残留进 main_content 喂给 AI 造成噪音）。
+# 覆盖所有媒体类型空括号占位：视频/语音/文件/图片 及带"消息"后缀的变体；无括号内容才算占位。
+_MEDIA_EMPTY_RE = re.compile(r'\[[^\]]*(?:视频|语音|文件|图片)[^\]]*\]\(\)')
 # dws 在缺 chat/list_conversation_message_v2 权限时，会在消息文本里注入下载提示语
 # （如「注意：如需下载使用dws chat message download-media命令下载…」）。这不是老板
 # 该操心的内容，且会污染喂给 AI 的上下文、误导质检，统一在此剥离。
