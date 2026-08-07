@@ -16,8 +16,9 @@ import runtime
 from runtime import (
     CREATE_NO_WINDOW, DWS_CMD, DWS_EXE, DWS_ENTRY, NODE, _DWS_CALL_TRACE,
     MEDIA_CACHE_DIR, DEBUG_LOG, DEBUG_LOG_MAX, log_debug,
-    SELF_SENDERS, GROUP_PUSH, MENTION_NAMES, _AT_RE,
-    _MEDIA_RE, _PIC_TAG_RE, _DWS_HINT_RE, _DWS_HINT_RE2,
+    SELF_SENDERS, GROUP_PUSH, MENTION_NAMES,
+    _MEDIA_RE, _PIC_TAG_RE, _MEDIA_EMPTY_RE, _NON_IMAGE_TAG_RE,
+    _DWS_HINT_RE, _DWS_HINT_RE2,
     _RECENT_CACHE, ACTIVE_WINDOW_SEC, LAST_SELF_SENT,
 )
 
@@ -137,9 +138,32 @@ def msg_sender_open_id(m):
     return m.get("sender_open_id") or extract_sender_open_id(m)
 
 
+def _norm_ts(v):
+    """把时间值归一化为【秒级 epoch 浮点】（毫秒时间戳 > 1e11 除以 1000）。
+
+    ⚠️ 2026-08-05 实锤根因（老板反馈"图片消息被误判最新、后发文字进背景"）：
+    dws 的 `lastMsgCreateAt` 是【毫秒】（13 位，如 1584669332376），而消息对象里的
+    createTime 常是【秒级字符串】（"2026-08-05 10:20:00"）或秒级数字——两者混用排序会
+    差 1000 倍，毫秒值被误排到"最新"，burst 窗口锚点选错，连发的后续消息全部掉进背景历史，
+    还导致 NOTIFIED 去重失效（job.ts 秒 vs lastMsgCreateAt 毫秒永不相等 → 重复处理）。
+    统一用本函数归一化为秒，全链路（PENDING.msgs[].ts / job.ts / NOTIFIED / 排序）单位一致。
+    """
+    try:
+        v = float(v)
+    except Exception:
+        return 0
+    if not v:
+        return 0
+    if v > 1e11:  # 毫秒级（>1973 年之后所有合法时间戳都是 13 位毫秒）
+        v /= 1000.0
+    return v
+
+
 def _msg_ts(m):
     """把消息的时间字段解析成可排序的时间戳（epoch 秒），解析失败退化为 0。
-    用真实时间排序比字符串排序稳（避免时间格式变化导致排序错乱）。"""
+    用真实时间排序比字符串排序稳（避免时间格式变化导致排序错乱）。
+    ⚠️ 数字分支必须走 _norm_ts：dws 偶发返回毫秒级 createTime（图片/媒体消息常见），
+    不归一化会与秒级字符串混排差 1000 倍（见 _norm_ts 注释）。"""
     raw = msg_field(m, "createTime", "create_time", "time", default="")
     if not raw:
         return 0
@@ -150,10 +174,7 @@ def _msg_ts(m):
             return datetime.datetime.strptime(raw[:26], fmt).timestamp()
         except Exception:
             pass
-    try:
-        return float(raw)
-    except Exception:
-        return 0
+    return _norm_ts(raw)
 
 
 _LAST_UNREAD_DIAG = 0.0  # 节流：拿到空未读/解析失败时，每 60s 最多记一条原始返回诊断
@@ -345,36 +366,46 @@ def _is_self(sender, sender_open_id=None):
 
 
 def group_msg_is_at_me(content):
-    """群消息是否 @了老板（用于微信通知高亮「有人@你」）。
-    返回 True/False。媒体消息 content 为空 → False（无法从文本判 @）。"""
+    """群消息是否 @了老板（用于微信通知高亮「有人@你」+ 群聊 AI 草稿预览触发）。
+    返回 True/False。媒体消息 content 为空 → False（无法从文本判 @）。
+    ⚠️ 2026-08-05 修复：钉钉 @ 可出现在【任意位置】且可能带双 @@（复制/输入法格式）——
+    原判定只认「以 @昵称 开头」导致句中 @（如「...如何处理@吉岩」）和「@@吉岩」前缀漏判，
+    老板实测收不到 @提醒。改为任意位置子串匹配（宁可多提醒、不漏真 @）。"""
     if not content:
         return False
     c = content.strip()
-    # @所有人 / @all（dws 发送占位 <@all> 也一并覆盖）→ 必然含老板
-    if "@所有人" in c or "@all" in c or "<@all>" in c:
+    # @所有人 → 必然含老板
+    if "@所有人" in c:
         return True
-    m = _AT_RE.match(c)
-    if m:
-        name = m.group(1).strip("，,。.!！?？：:；;")
-        if name in MENTION_NAMES:
+    # @all / <@all>（钉钉发送占位）→ 词边界匹配，避免 "allan"/"allstar" 等普通词误命中
+    if "<@all>" in c or re.search(r"(?:^|[\s（(])@all(?:[\s）).!！?？：:；;，,]|$)", c, re.IGNORECASE):
+        return True
+    # 任意位置含 "@昵称"：兼容句首 / 句中 / 句末 / 多个 @ 连排 / "@@昵称" 双 @ 格式
+    for name in MENTION_NAMES:
+        if name and ("@" + name) in c:
             return True
     return False
 
 
 def extract_media_ids(content):
-    """从消息 content 提取所有图片 mediaId（钉钉内联格式，见上）。无图返回 []。"""
+    """从消息 content 提取所有图片 mediaId（钉钉内联格式，见上）。无图返回 []。
+    ⚠️ 2026-08-07 修复：只提取【图片】mediaId——视频/语音/文件标签的 mediaId 先整段剔除，
+    防止把视频当图片下载（download-media 会拿到视频文件，build_image_block 按 image/jpeg
+    内联 → SDK 400 mime）。"""
     if not content:
         return []
-    return _MEDIA_RE.findall(content)
+    c = _NON_IMAGE_TAG_RE.sub("", content)  # 剥掉视频/语音/文件标签，只留图片/裸 mediaId
+    return _MEDIA_RE.findall(c)
 
 
 def clean_text_for_ai(content):
-    """去掉 content 里的 [图片消息](mediaId=...) 等富媒体噪音，以及 dws 权限缺失时
-    注入的下载提示语（「注意：如需下载使用dws chat message download-media命令下载…」），
+    """去掉 content 里的 [图片消息](mediaId=...) 等富媒体噪音（含 [视频]() 空括号占位），
+    以及 dws 权限缺失时注入的下载提示语（「注意：如需下载使用dws chat message download-media命令下载…」），
     保留纯文字说明作为喂给 AI 的上下文（否则 AI 会看到 mediaId 垃圾或 dws 提示导致乱回）。"""
     if not content:
         return ""
     c = _PIC_TAG_RE.sub("", content)
+    c = _MEDIA_EMPTY_RE.sub("", c)  # ⚠️ 2026-08-07 补：'[视频]()' 空括号占位（无 mediaId）
     c = _DWS_HINT_RE.sub("", c)
     c = _DWS_HINT_RE2.sub("", c)
     return c.strip()
